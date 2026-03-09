@@ -1,0 +1,2820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Form &amp; Practice — Financial Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <style>html,body{margin:0;padding:0;background:#ffffff;}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact;}button{display:none!important;}}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+    const { useState, useCallback, useMemo, useRef } = React;
+    const { LineChart, Line, BarChart, Bar, AreaChart, Area,
+             XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+             Legend, ReferenceLine, Cell } = Recharts;
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const CLINICS = ["Mt Evelyn", "Olinda", "Chirnside Park"];
+const OWNER_SALARY_CLINICS = ["Mt Evelyn", "Olinda"];
+
+const CLINIC_NAME_MAP = [[/mt\s*evelyn/i,"Mt Evelyn"],[/olinda/i,"Olinda"],[/chirnside/i,"Chirnside Park"]];
+
+// Account classification patterns
+const OWNER_RX    = [/^owners?\s*salary/i,/^owners?\s*super/i,/jerome\s*higgins/i,/kate\s*rae/i,/jerry\s*higgins/i,/owners?\s*salary\s*[-–]\s*(kate|jerome|jerry)/i,/owners?\s*superannuation\s*[-–]\s*(kate|jerome|jerry)/i];
+const DA_RX       = [/depreciation/i,/amortis/i,/amortiz/i,/eofy\s*adj.*depn/i,/depn/i];
+const INTEREST_RX = [/^interest\s*expense/i,/^loan\s*interest/i,/^finance\s*charge/i];
+const INTERCO_RX  = [/^chirnside\s*wages/i,/^chirnside\s*super/i];
+// Exclude entirely — not operating expenses
+const EXCLUDE_RX  = [/^dividends?\s*paid/i,/^income\s*tax\s*expense/i];
+// Flag as non-recurring
+const NONRECUR_RX = [/^management\s*fees?/i,/^eofy\s*adj/i,/^minor\s*fit\s*out/i,/^practice\s*set\s*up/i];
+
+const P = {
+  bg:"#f8fafc", surface:"#ffffff", alt:"#E2E2DC", border:"#0f172a",
+  gold:"#b45309", goldL:"#d97706", green:"#059669", red:"#dc2626",
+  blue:"#2563eb", purple:"#7c3aed", orange:"#ea580c", teal:"#0d9488",
+  text:"#0f172a", muted:"#64748b", dim:"#cbd5e1",
+};
+const CC = {"Mt Evelyn":"#003B49","Olinda":"#F26439","Chirnside Park":"#6F7C7C"};
+const SVC_COLORS = {
+  "Physiotherapy Revenue":P.blue,"Clinical Classes":P.green,
+  "Reformer Pilates":P.purple,"Massage Revenue":P.orange,
+  "Retail Sales":P.gold,"Sales":P.gold,"Other Revenue":P.teal,
+  "Osteopathy Revenue":P.teal,"Osteo Revenue":P.teal,
+};
+
+// ─── Quarter label parser ─────────────────────────────────────────────────────
+// "Oct-Dec 2025" → "Q2 FY26",  "Jul-Sept 2025" → "Q1 FY26", etc.
+function colHeaderToQuarter(s) {
+  if (!s || typeof s !== "string") return null;
+  const m = s.match(/(\w+)\s*[-–]\s*\w*\s*(\d{4})/) || s.match(/(\w+)\s+(\d{4})/);
+  if (!m) return null;
+  const endMonth = s.match(/[-–]\s*(\w+)\s+(\d{4})/);
+  const mon  = endMonth ? endMonth[1].toLowerCase().slice(0,3) : m[1].toLowerCase().slice(0,3);
+  const yr   = parseInt(endMonth ? endMonth[2] : m[2]);
+  const MAP  = { sep:["Q1",1], dec:["Q2",1], mar:["Q3",0], jun:["Q4",0] };
+  // Handle "Sept" → "sep"
+  const key  = mon === "sep" || mon === "sep" ? "sep" : mon;
+  const hit  = MAP[key];
+  if (!hit) return null;
+  return `Q${hit[0][1]} FY${String(yr + hit[1]).slice(2)}`;
+}
+
+function detectClinic(s) {
+  if (!s) return null;
+  for (const [rx,name] of CLINIC_NAME_MAP) if (rx.test(String(s))) return name;
+  return null;
+}
+
+function qKey(q) {
+  const m = q?.match(/Q(\d)\s*FY(\d+)/);
+  return m ? `FY${m[2]}-Q${m[1]}` : (q||"");
+}
+
+// ─── Multi-column Xero parser ─────────────────────────────────────────────────
+// Returns array of { clinic, quarter, accounts } — one per column
+function parseXeroMultiCol(arrayBuf) {
+  const wb   = XLSX.read(new Uint8Array(arrayBuf), { type:"array" });
+  const ws   = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+
+  // Detect clinic from header rows
+  let clinic = null;
+  for (let i = 0; i < Math.min(5, rows.length); i++) {
+    for (const cell of rows[i]) {
+      const c = detectClinic(cell);
+      if (c) { clinic = c; break; }
+    }
+    if (clinic) break;
+  }
+
+  // Find header row (contains "Account" in col 0)
+  let headerRowIdx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i][0]||"").trim().toLowerCase() === "account") { headerRowIdx = i; break; }
+  }
+  if (headerRowIdx === -1) return [];
+
+  // Parse quarter labels from header row
+  const headerRow = rows[headerRowIdx];
+  const quarters  = [];
+  for (let col = 1; col < headerRow.length; col++) {
+    const q = colHeaderToQuarter(String(headerRow[col]||""));
+    quarters.push(q);  // may be null for empty cols
+  }
+
+  // Build one account map per quarter column
+  const numCols = quarters.length;
+  const accountsByCol = Array.from({length: numCols}, () => ({}));
+  let section = "income";
+
+  for (let ri = headerRowIdx + 1; ri < rows.length; ri++) {
+    const row   = rows[ri];
+    const label = String(row[0]||"").trim();
+    if (!label) continue;
+
+    const low = label.toLowerCase();
+    // Section detection
+    if (low.match(/^trading income/))       { section="income"; continue; }
+    if (low.match(/^other income/))         { section="other";  continue; }
+    if (low.match(/^cost of (sales|goods)/)) { section="cogs";  continue; }
+    if (low.match(/^gross profit/))         continue;
+    if (low.match(/^operating expenses?/))  { section="opex";  continue; }
+    if (low.match(/^(total\b|net profit|net loss)/)) continue;
+    if (label.match(/^Total /i))            continue;
+
+    // Exclusions — completely skip these rows
+    if (EXCLUDE_RX.some(r=>r.test(label))) continue;
+
+    const isInterco  = INTERCO_RX.some(r=>r.test(label));
+    const isNonRecur = NONRECUR_RX.some(r=>r.test(label));
+
+    // Read value for each column
+    for (let col = 0; col < numCols; col++) {
+      const raw = row[col + 1];
+      if (raw === null || raw === undefined) continue;
+      if (typeof raw === "string" && raw.startsWith("=")) continue;
+      const val = typeof raw === "number" ? raw : parseFloat(String(raw).replace(/[$,\s]/g,""));
+      if (isNaN(val) || val === 0) continue;
+
+      const key = label.replace(/\W+/g,"_").toLowerCase() + "_" + col;
+      accountsByCol[col][key] = { name:label, val, section, isInterco, isNonRecur };
+    }
+  }
+
+  // Return one record per valid quarter
+  return quarters.map((q, i) => {
+    if (!q || !clinic) return null;
+    const acctCount = Object.keys(accountsByCol[i]).length;
+    if (acctCount === 0) return null;
+    return { clinic, quarter:q, accounts:accountsByCol[i] };
+  }).filter(Boolean);
+}
+
+// ─── Metrics ─────────────────────────────────────────────────────────────────
+function classify(name, isInterco) {
+  if (isInterco)                          return "interco";
+  if (OWNER_RX.some(r=>r.test(name)))     return "owner";
+  if (DA_RX.some(r=>r.test(name)))        return "da";
+  if (INTEREST_RX.some(r=>r.test(name)))  return "interest";
+  if (NONRECUR_RX.some(r=>r.test(name)))  return "nonrecur";
+  return "normal";
+}
+
+function computeMetrics(accounts, clinic) {
+  let revenue=0, otherIncome=0, cogs=0, opex=0;
+  let ownerSalary=0, ownerSuper=0, da=0, interest=0, interco=0, wages=0, nonRecur=0;
+  const expenseDetail=[], incomeDetail=[];
+
+  for (const acct of Object.values(accounts)) {
+    const cls = classify(acct.name, acct.isInterco);
+
+    if (acct.section==="income") {
+      const v=Math.abs(acct.val); revenue+=v;
+      incomeDetail.push({name:acct.name, val:v});
+    } else if (acct.section==="other") {
+      otherIncome+=Math.abs(acct.val);
+    } else if (acct.section==="cogs") {
+      cogs+=Math.abs(acct.val);
+    } else if (acct.section==="opex") {
+      if (cls==="interco") {
+        interco+=acct.val;
+        expenseDetail.push({name:acct.name, val:acct.val, cls});
+        continue;
+      }
+      const v=Math.abs(acct.val);
+      if (cls==="owner" && OWNER_SALARY_CLINICS.includes(clinic)) {
+        /super/i.test(acct.name) ? ownerSuper+=v : ownerSalary+=v;
+      } else if (cls==="da")       { da+=v; }
+        else if (cls==="interest") { interest+=v; }
+        else if (cls==="nonrecur") { nonRecur+=v; }
+        else { opex+=v; }
+      // Owner and nonrecur still count in opex for net profit calc
+      if (cls==="owner"||cls==="da"||cls==="interest"||cls==="nonrecur") opex+=v;
+      if (/^wages|^salaries/i.test(acct.name) && cls==="normal") wages+=v;
+      expenseDetail.push({name:acct.name, val:v, cls});
+    }
+  }
+
+  const grossProfit = revenue - cogs;
+  const netProfit   = grossProfit + otherIncome - opex;
+  const ebitda      = netProfit + interest + da;
+  const adjEbitda   = ebitda + ownerSalary + ownerSuper + nonRecur;  // nonRecur = mgmt fees, one-off related-party
+
+  const ownerEarnings   = netProfit + ownerSalary + ownerSuper;
+  const revenuePerWage  = wages > 0 ? revenue / wages : null;
+  return {
+    revenue, otherIncome, cogs, grossProfit, opex, netProfit,
+    ownerSalary, ownerSuper, da, interest, interco, wages, nonRecur,
+    ebitda, adjEbitda, ownerEarnings, revenuePerWage,
+    valuationLow: adjEbitda*3, valuationHigh: adjEbitda*5,
+    expenseDetail, incomeDetail,
+    ebitdaMargin: revenue ? (adjEbitda/revenue)*100 : 0,
+    gpMargin:     revenue ? (grossProfit/revenue)*100 : 0,
+    wageRatio:    revenue ? (wages/revenue)*100 : 0,
+    opexRatio:    revenue ? (opex/revenue)*100 : 0,
+  };
+}
+
+// ─── Formatting ───────────────────────────────────────────────────────────────
+const fmt  = (n,d=0) => new Intl.NumberFormat("en-AU",{style:"currency",currency:"AUD",minimumFractionDigits:d,maximumFractionDigits:d}).format(n||0);
+const fmtK = n => Math.abs(n)>=1e6?`$${(n/1e6).toFixed(1)}M`:Math.abs(n)>=1e3?`$${(n/1e3).toFixed(0)}k`:fmt(n);
+const pct  = (a,b) => b?((a/b)*100).toFixed(1)+"%":"—";
+
+// ─── UI primitives ────────────────────────────────────────────────────────────
+const SH = ({children}) => (
+  <div style={{display:"flex",alignItems:"center",gap:10,margin:"26px 0 12px"}}>
+    <div style={{width:3,height:15,background:P.gold,borderRadius:2}}/>
+    <span style={{fontSize:11,fontWeight:700,color:P.muted,textTransform:"uppercase",letterSpacing:1.6}}>{children}</span>
+  </div>
+);
+
+const Card = ({label,value,sub,color,delta,small}) => (
+  <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:small?"11px 15px":"17px 20px"}}>
+    <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.3,fontFamily:"monospace",marginBottom:4}}>{label}</div>
+    <div style={{fontSize:small?17:23,fontWeight:700,color:color||P.text,fontFamily:"'DM Serif Display',Georgia,serif",lineHeight:1.1}}>{value}</div>
+    {sub&&<div style={{fontSize:11,color:P.muted,marginTop:3}}>{sub}</div>}
+    {delta!==undefined&&<div style={{fontSize:10,color:delta>=0?P.green:P.red,marginTop:3}}>{delta>=0?"▲":"▼"} {Math.abs(delta).toFixed(1)}% QoQ</div>}
+  </div>
+);
+
+const Flag = ({type,children}) => {
+  const col={risk:P.red,upside:P.green,info:P.blue,warn:"#f59e0b"}[type]||P.blue;
+  const ico={risk:"⚠",upside:"↑",info:"ℹ",warn:"⚑"}[type]||"ℹ";
+  return (
+    <div style={{display:"flex",gap:10,alignItems:"flex-start",background:P.alt,borderRadius:8,border:`1px solid ${col}33`,padding:"10px 14px",marginBottom:8}}>
+      <span style={{color:col,fontSize:14,marginTop:1,flexShrink:0}}>{ico}</span>
+      <span style={{fontSize:13,color:P.text,lineHeight:1.6}}>{children}</span>
+    </div>
+  );
+};
+
+const TT = ({active,payload,label}) => {
+  if(!active||!payload?.length) return null;
+  return (
+    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:8,padding:"10px 14px",maxWidth:260}}>
+      <div style={{color:P.muted,fontSize:11,marginBottom:6}}>{label}</div>
+      {payload.map(p=>(
+        <div key={p.name} style={{color:p.color||P.text,fontSize:12,fontWeight:600,marginBottom:2}}>
+          {p.name}: {typeof p.value==="number"&&Math.abs(p.value)>100?fmtK(p.value):`${Number(p.value).toFixed(1)}%`}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ─── Drop zone ────────────────────────────────────────────────────────────────
+function DropZone({onPL, onCash}) {
+  const [drag,setDrag] = useState(false);
+  const ref = useRef();
+  const process = useCallback(async (fileList) => {
+    const plResults=[], cfResults=[];
+    for (const file of Array.from(fileList)) {
+      if (!file.name.match(/\.xlsx?$/i)) continue;
+      try {
+        const buf = await file.arrayBuffer();
+        // Cash manager files: match "cash" anywhere in filename
+        const isCash = /cash/i.test(file.name);
+        if (isCash) {
+          const cf = parseXeroCashManager(buf);
+          if (cf) cfResults.push(cf);
+        } else {
+          const parsed = parseXeroMultiCol(buf);
+          plResults.push(...parsed);
+        }
+      } catch(e) { console.warn(file.name, e); }
+    }
+    if (plResults.length && onPL) onPL(plResults);
+    if (cfResults.length && onCash) onCash(cfResults);
+  }, [onPL, onCash]);
+
+  return (
+    <div onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{e.preventDefault();setDrag(false);process(e.dataTransfer.files)}}
+      onClick={()=>ref.current.click()}
+      style={{border:`2px dashed ${drag?P.gold:P.border}`,borderRadius:12,padding:"26px 24px",textAlign:"center",cursor:"pointer",background:drag?`${P.gold}10`:P.surface,transition:"all 0.2s"}}>
+      <div style={{fontSize:26,marginBottom:8,opacity:0.5}}>📂</div>
+      <div style={{fontSize:14,color:P.muted,marginBottom:3}}>Drop your Xero files here — P&amp;L and Cash Flow Manager files accepted</div>
+      <div style={{fontSize:12,color:P.dim}}>Files with "cash" in the filename go to the Cash Flow tab · everything else loads as P&amp;L</div>
+      <input ref={ref} type="file" accept=".xlsx,.xls" multiple style={{display:"none"}} onChange={e=>process(e.target.files)}/>
+    </div>
+  );
+}
+
+// ─── Flags ────────────────────────────────────────────────────────────────────
+function makeFlags(m, clinic, quarter, allUploads) {
+  const flags = [];
+
+  if (m.ebitdaMargin < 10)
+    flags.push({type:"risk", msg:`Adj. EBITDA margin is ${m.ebitdaMargin.toFixed(1)}% — below the 10–15% threshold typical for viable physio clinics.`});
+  else if (m.ebitdaMargin > 25)
+    flags.push({type:"upside", msg:`Strong Adj. EBITDA margin of ${m.ebitdaMargin.toFixed(1)}% — well above sector median, positive for valuation.`});
+
+  if (m.wageRatio > 55 && m.wages > 0)
+    flags.push({type:"risk", msg:`Wages-to-revenue ratio is ${m.wageRatio.toFixed(1)}%. Allied health benchmark is typically 45–55%. Review staffing mix and practitioner utilisation.`});
+
+  if (m.ownerSalary===0 && OWNER_SALARY_CLINICS.includes(clinic))
+    flags.push({type:"warn", msg:`No owner salary detected for ${clinic}. Confirm with bookkeeper that Jerome/Kate drawings are correctly coded.`});
+
+  if (m.ownerSalary>0 && m.ownerSuper===0 && OWNER_SALARY_CLINICS.includes(clinic))
+    flags.push({type:"warn", msg:`Owner salary found (${fmt(m.ownerSalary)}) but no separate owner super account. ~${fmt(m.ownerSalary*0.115)} is likely pooled in the Superannuation line — ask bookkeeper to split it. This understates Adj. EBITDA.`});
+
+  if (Math.abs(m.interco)>500)
+    flags.push({type:"info", msg:`Intercompany recharge of ${fmt(Math.abs(m.interco))} detected (Chirnside Wages / Chirnside Super). Excluded from clean EBITDA. Confirm the offsetting entry exists in Chirnside Park's file.`});
+
+  if (m.da>0)
+    flags.push({type:"info", msg:`D&A of ${fmt(m.da)} detected this quarter. This is likely a year-end journal (EOFY ADJ). For inter-quarter comparisons, consider spreading it across 4 quarters (~${fmt(m.da/4)}/quarter).`});
+
+  if (m.nonRecur>0)
+    flags.push({type:"warn", msg:`Non-recurring / one-off items of ${fmt(m.nonRecur)} detected (e.g. Management Fees, fit-out costs). Excluded from normalised EBITDA above. Verify these are genuine one-offs before including in valuation EBITDA.`});
+
+  if (m.adjEbitda>0)
+    flags.push({type:"upside", msg:`Indicative valuation: ${fmt(m.valuationLow)} – ${fmt(m.valuationHigh)} (3–5× annualised Adj. EBITDA of ${fmt(m.adjEbitda*4)}).`});
+
+  // QoQ
+  const prev = allUploads.filter(d=>d.clinic===clinic&&d.quarter!==quarter).sort((a,b)=>qKey(a.quarter).localeCompare(qKey(b.quarter)));
+  if (prev.length>0) {
+    const lm = computeMetrics(prev[prev.length-1].accounts, clinic);
+    const rc = lm.revenue?((m.revenue-lm.revenue)/lm.revenue)*100:0;
+    if (Math.abs(rc)>10)
+      flags.push({type:rc>0?"upside":"risk", msg:`Revenue ${rc>0?"up":"down"} ${Math.abs(rc).toFixed(1)}% vs ${prev[prev.length-1].quarter}. ${rc<0?"Investigate patient volume or fee schedule changes.":"Strong growth — check capacity and practitioner utilisation."}`});
+    const em = lm.revenue?(lm.adjEbitda/lm.revenue)*100:0;
+    const ed = m.ebitdaMargin-em;
+    if (Math.abs(ed)>3)
+      flags.push({type:ed>0?"upside":"risk", msg:`EBITDA margin ${ed>0?"improved":"deteriorated"} ${Math.abs(ed).toFixed(1)}pp vs ${prev[prev.length-1].quarter} (${em.toFixed(1)}% → ${m.ebitdaMargin.toFixed(1)}%).`});
+  }
+
+  return flags;
+}
+
+// ─── GM Report ────────────────────────────────────────────────────────────────
+function GMReport({uploads}) {
+  const quarters = [...new Set(uploads.map(d=>d.quarter))].sort((a,b)=>qKey(a).localeCompare(qKey(b)));
+  const lq = quarters[quarters.length-1];
+  const pq = quarters[quarters.length-2];
+
+  const cms = CLINICS.map(c=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===lq);return d?{clinic:c,...computeMetrics(d.accounts,c)}:null;}).filter(Boolean);
+  const tot = cms.reduce((a,m)=>({rev:a.rev+m.revenue,ebitda:a.ebitda+m.adjEbitda,opex:a.opex+m.opex,net:a.net+m.netProfit,gp:a.gp+m.grossProfit}),{rev:0,ebitda:0,opex:0,net:0,gp:0});
+  const ptot = pq?CLINICS.reduce((a,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===pq);if(!d)return a;const m=computeMetrics(d.accounts,c);return{rev:a.rev+m.revenue,ebitda:a.ebitda+m.adjEbitda};},{rev:0,ebitda:0}):null;
+
+  // Trailing 4Q
+  const t4 = quarters.slice(-4).reduce((s,q)=>s+CLINICS.reduce((cs,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);return cs+(d?computeMetrics(d.accounts,c).adjEbitda:0)},0),0);
+
+  return (
+    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:28}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:24}}>
+        <div>
+          <div style={{fontFamily:"'DM Serif Display',serif",fontSize:20,color:P.text}}>Form &amp; Practice — Group Performance</div>
+          <div style={{fontSize:12,color:P.muted,marginTop:4}}>{lq} · General Manager Report · Ben Croxford</div>
+        </div>
+        <div style={{fontSize:9,color:P.dim,fontFamily:"monospace",alignSelf:"flex-start",textTransform:"uppercase",letterSpacing:1}}>Confidential · Management Use Only</div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:22}}>
+        {[
+          {label:"Group Revenue",    value:fmtK(tot.rev),      delta:ptot?.rev?((tot.rev-ptot.rev)/ptot.rev*100):undefined},
+          {label:"Group Adj. EBITDA",value:fmtK(tot.ebitda),   color:P.gold, delta:ptot?.ebitda?((tot.ebitda-ptot.ebitda)/Math.abs(ptot.ebitda)*100):undefined},
+          {label:"EBITDA Margin",    value:tot.rev?pct(tot.ebitda,tot.rev):"—", color:P.gold},
+          {label:"Trailing 4Q Ann.", value:fmtK(t4),           color:P.goldL},
+        ].map(c=><Card key={c.label} {...c} small/>)}
+      </div>
+
+      <div style={{background:P.alt,borderRadius:10,overflow:"hidden",marginBottom:20}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+          <thead>
+            <tr style={{borderBottom:`1px solid ${P.border}`}}>
+              {["Clinic","Revenue","Gross Profit","OpEx","Net Profit","Adj. EBITDA","Margin"].map(h=>(
+                <th key={h} style={{padding:"10px 14px",textAlign:h==="Clinic"?"left":"right",color:P.muted,fontSize:10,textTransform:"uppercase",letterSpacing:0.8}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {cms.map((m,i)=>(
+              <tr key={i} style={{borderBottom:`1px solid ${P.border}22`}}>
+                <td style={{padding:"10px 14px",color:CC[m.clinic],fontWeight:600}}>{m.clinic}</td>
+                {[m.revenue,m.grossProfit,m.opex,m.netProfit].map((v,j)=>(
+                  <td key={j} style={{padding:"10px 14px",textAlign:"right",color:P.text,fontVariantNumeric:"tabular-nums"}}>{fmtK(v)}</td>
+                ))}
+                <td style={{padding:"10px 14px",textAlign:"right",color:P.gold,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{fmtK(m.adjEbitda)}</td>
+                <td style={{padding:"10px 14px",textAlign:"right",color:m.ebitdaMargin>15?P.green:m.ebitdaMargin>8?P.gold:P.red,fontWeight:600}}>{m.ebitdaMargin.toFixed(1)}%</td>
+              </tr>
+            ))}
+            <tr style={{borderTop:`1px solid ${P.border}`,background:`${P.gold}08`}}>
+              <td style={{padding:"10px 14px",color:P.gold,fontWeight:700}}>GROUP</td>
+              {[tot.rev,tot.gp,tot.opex,tot.net].map((v,j)=>(
+                <td key={j} style={{padding:"10px 14px",textAlign:"right",color:P.goldL,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{fmtK(v)}</td>
+              ))}
+              <td style={{padding:"10px 14px",textAlign:"right",color:P.gold,fontWeight:700}}>{fmtK(tot.ebitda)}</td>
+              <td style={{padding:"10px 14px",textAlign:"right",color:P.gold,fontWeight:700}}>{tot.rev?pct(tot.ebitda,tot.rev):"—"}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div style={{fontSize:11,color:P.dim,fontStyle:"italic",lineHeight:1.6}}>
+        Adj. EBITDA adds back: owner salary &amp; super, D&amp;A, interest, and one-off related-party fees (e.g. management fees). Dividends paid, income tax, and intercompany recharges excluded. ✓ = verified by accountant (Peter Gillis, ROCG).
+      </div>
+    </div>
+  );
+}
+
+// ─── Expense table ────────────────────────────────────────────────────────────
+function ExpTable({items, total}) {
+  const TAG = cls => {
+    const m={owner:[P.gold,"OWNER ▲"],da:[P.blue,"D&A ▲"],interest:[P.purple,"INTEREST ▲"],interco:[P.red,"INTERCO"],nonrecur:["#f59e0b","ONE-OFF"]}[cls];
+    if(!m) return null;
+    return <span style={{background:`${m[0]}22`,color:m[0],fontSize:10,padding:"2px 7px",borderRadius:4,fontFamily:"monospace",whiteSpace:"nowrap"}}>{m[1]}</span>;
+  };
+  return (
+    <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+      <thead>
+        <tr style={{borderBottom:`1px solid ${P.border}`}}>
+          {["Account","Amount","% OpEx",""].map(h=>(
+            <th key={h} style={{padding:"8px 12px",textAlign:h==="Account"?"left":"right",color:P.muted,fontSize:10,textTransform:"uppercase",letterSpacing:0.8}}>{h}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {[...items].sort((a,b)=>Math.abs(b.val)-Math.abs(a.val)).slice(0,22).map((item,i)=>(
+          <tr key={i} style={{borderBottom:`1px solid ${P.border}14`,background:item.cls&&item.cls!=="normal"?`${P.alt}80`:"transparent"}}>
+            <td style={{padding:"7px 12px",color:P.text}}>{item.name}</td>
+            <td style={{padding:"7px 12px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:item.val<0?P.red:P.text}}>{fmt(item.val)}</td>
+            <td style={{padding:"7px 12px",textAlign:"right",color:P.muted}}>{item.val>0?pct(item.val,total):"—"}</td>
+            <td style={{padding:"7px 12px",textAlign:"right"}}>{TAG(item.cls)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+
+
+// ─── Annual Overview ──────────────────────────────────────────────────────────
+// Aggregates quarters → fiscal years, renders pitch-deck style charts + export
+const CURRENT_FY = "FY26"; // update each year
+
+// Verified Adj. EBITDA figures from accountant (Peter Gillis, ROCG)
+// Formula: Net Profit + Owner Salary + Owner Super + D&A + Interest + Management Fees (related-party)
+// Note: MTE includes Chirnside Park (same legal entity); Olinda separate entity
+const VERIFIED_EBITDA = {
+  FY23: { "Mt Evelyn": 69042, "Olinda": 74492, "Chirnside Park": null, group: 142178 },
+  FY24: { "Mt Evelyn": 80982, "Olinda": 95256, "Chirnside Park": null, group: 157972 },
+  FY25: { "Mt Evelyn": 81530, "Olinda": 157683, "Chirnside Park": null, group: 239214 },
+  // Note: Chirnside is consolidated into Mt Evelyn in Peter's workings
+};
+
+function getFY(quarterLabel) {
+  // "Q2 FY26" → "FY26"
+  const m = quarterLabel?.match(/FY(\d+)/);
+  return m ? `FY${m[1]}` : null;
+}
+
+function aggregateToFY(uploads, clinics) {
+  // Returns { FY23:{MtEvelyn:{revenue,adjEbitda,...}, Olinda:{...}, group:{...}}, ... }
+  const fySet = {};
+  for (const d of uploads) {
+    const fy = getFY(d.quarter);
+    if (!fy) continue;
+    if (!fySet[fy]) fySet[fy] = {};
+    if (!fySet[fy][d.clinic]) fySet[fy][d.clinic] = { revenue:0, adjEbitda:0, ebitda:0, wages:0, opex:0, netProfit:0, quarters:0 };
+    const m = computeMetrics(d.accounts, d.clinic);
+    const s = fySet[fy][d.clinic];
+    s.revenue   += m.revenue;
+    s.adjEbitda += m.adjEbitda;
+    s.ebitda    += m.ebitda;
+    s.wages     += m.wages;
+    s.opex      += m.opex;
+    s.netProfit += m.netProfit;
+    s.quarters++;
+  }
+  // Add group totals
+  for (const fy of Object.keys(fySet)) {
+    const g = { revenue:0, adjEbitda:0, ebitda:0, wages:0, opex:0, netProfit:0, quarters:0 };
+    for (const c of clinics) {
+      if (fySet[fy][c]) {
+        g.revenue   += fySet[fy][c].revenue;
+        g.adjEbitda += fySet[fy][c].adjEbitda;
+        g.ebitda    += fySet[fy][c].ebitda;
+        g.wages     += fySet[fy][c].wages;
+        g.opex      += fySet[fy][c].opex;
+        g.netProfit += fySet[fy][c].netProfit;
+        g.quarters  += fySet[fy][c].quarters;
+      }
+    }
+    fySet[fy]["__group"] = g;
+  }
+  return fySet;
+}
+
+function isFullFY(fyData, clinics) {
+  // A "full" FY has 4 quarters for at least one clinic
+  return clinics.some(c => fyData[c]?.quarters >= 4);
+}
+
+function AnnualOverviewView({ uploads, quarters, loadedClinics }) {
+  const [exportMode, setExportMode] = useState(false);
+  const printRef = useRef();
+
+  const fyData = useMemo(() => aggregateToFY(uploads, loadedClinics), [uploads, loadedClinics]);
+  const fyYears = useMemo(() => Object.keys(fyData).sort(), [fyData]);
+
+  // Split full years vs current YTD
+  const fullYears = fyYears.filter(fy => fy !== CURRENT_FY && isFullFY(fyData[fy], loadedClinics));
+  const ytdYear   = fyYears.find(fy => fy === CURRENT_FY) || fyYears[fyYears.length-1];
+  const ytdQCount = ytdYear ? Math.max(...loadedClinics.map(c => fyData[ytdYear]?.[c]?.quarters||0)) : 0;
+
+  // Build chart rows for annual bar charts
+  function buildChartRows(fy, scope) {
+    // scope: "__group" or clinic name
+    const d = fyData[fy]?.[scope];
+    if (!d) return null;
+    const full = isFullFY(fyData[fy], loadedClinics);
+    // Use verified accountant figure if available (full years only)
+    const verifiedKey = scope === "__group" ? "group" : scope;
+    const verifiedEbitda = full && VERIFIED_EBITDA[fy]?.[verifiedKey] != null
+      ? VERIFIED_EBITDA[fy][verifiedKey]
+      : null;
+    const adjEbitda = verifiedEbitda ?? d.adjEbitda;
+    return {
+      fy,
+      revenue:   d.revenue,
+      adjEbitda,
+      adjEbitdaXero: d.adjEbitda,        // keep Xero calc for reference
+      verified:  verifiedEbitda != null,  // flag for tooltip/label
+      margin:    d.revenue ? (adjEbitda / d.revenue) * 100 : 0,
+      ytd:       !full,
+    };
+  }
+
+  // Group annual rows
+  const groupRows = [...fullYears, ...(ytdYear?[ytdYear]:[])].map(fy => buildChartRows(fy, "__group")).filter(Boolean);
+
+  // Per-clinic annual rows for comparison
+  const clinicRows = loadedClinics.map(c => ({
+    clinic: c,
+    rows: [...fullYears, ...(ytdYear?[ytdYear]:[])].map(fy => buildChartRows(fy, c)).filter(Boolean),
+  }));
+
+  // YoY growth for group
+  function yoy(rows, key) {
+    if (rows.length < 2) return null;
+    const prev = rows[rows.length-2][key];
+    const curr = rows[rows.length-1][key];
+    if (!prev) return null;
+    return ((curr - prev) / Math.abs(prev)) * 100;
+  }
+
+  const handlePrint = () => {
+    window.print();
+  };
+
+  const DeckCard = ({children, style={}}) => (
+    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:14,padding:"22px 24px",pageBreakInside:"avoid",...style}}>
+      {children}
+    </div>
+  );
+
+  const ChartLabel = ({title, sub}) => (
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:13,fontWeight:700,color:P.text,letterSpacing:0.3}}>{title}</div>
+      {sub&&<div style={{fontSize:11,color:P.muted,marginTop:2}}>{sub}</div>}
+    </div>
+  );
+
+  const KPIStrip = ({rows, scope}) => {
+    const last = rows[rows.length-1];
+    const prev = rows[rows.length-2];
+    if (!last) return null;
+    const revGrowth = prev?.revenue ? ((last.revenue-prev.revenue)/prev.revenue)*100 : null;
+    const ebiGrowth = prev?.adjEbitda ? ((last.adjEbitda-prev.adjEbitda)/Math.abs(prev.adjEbitda))*100 : null;
+    return (
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:16}}>
+        {[
+          {label: last.ytd?`Revenue ${ytdYear} YTD`:`Revenue ${last.fy}`, val:fmtK(last.revenue), delta:revGrowth, color:P.text},
+          {label: last.ytd?`EBITDA ${ytdYear} YTD`:`Adj. EBITDA ${last.fy}${last.verified?' ✓':''}`, val:fmtK(last.adjEbitda), delta:ebiGrowth, color:P.gold, sub: last.verified?'Accountant verified':last.ytd?'':'Xero estimate'},
+          {label:"EBITDA Margin", val:`${last.margin.toFixed(1)}%`, color:last.margin>=15?P.green:last.margin>=10?P.gold:P.red},
+          {label:"Annualised EBITDA", val: last.ytd && ytdQCount>0 ? fmtK(last.adjEbitda/ytdQCount*4) : "Full year", color:P.teal, sub: last.ytd?`(${ytdQCount}Q × 4)`:""},
+        ].map((k,i)=>(
+          <div key={i} style={{background:P.alt,borderRadius:10,padding:"12px 14px",border:`1px solid ${P.border}`}}>
+            <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>{k.label}</div>
+            <div style={{fontSize:18,fontWeight:700,color:k.color,fontFamily:"'DM Serif Display',serif"}}>{k.val}</div>
+            {k.sub&&<div style={{fontSize:10,color:k.sub==='Accountant verified'?P.green:P.muted,fontWeight:k.sub==='Accountant verified'?600:400}}>{k.sub}</div>}
+            {k.delta!=null&&<div style={{fontSize:10,color:k.delta>=0?P.green:P.red,marginTop:2}}>{k.delta>=0?"▲":"▼"} {Math.abs(k.delta).toFixed(1)}% YoY</div>}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  if (fyYears.length === 0) return (
+    <div style={{textAlign:"center",padding:"60px",color:P.muted}}>No data loaded yet.</div>
+  );
+
+  return (
+    <div>
+      {/* Header row */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:600,color:P.text,marginBottom:3}}>Annual Overview</div>
+          <div style={{fontSize:12,color:P.muted}}>
+            {fullYears.join(", ")}{ytdYear?` · ${ytdYear} YTD (${ytdQCount}Q)`:""} · Pitch-deck ready
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={handlePrint}
+            style={{background:`${P.gold}22`,border:`1px solid ${P.gold}66`,color:P.gold,borderRadius:8,padding:"8px 18px",cursor:"pointer",fontSize:12,fontWeight:600}}>
+            ⬇ Export / Print
+          </button>
+        </div>
+      </div>
+
+      <div ref={printRef} id="annual-overview-print">
+        {/* ── GROUP SECTION ─────────────────────────────── */}
+        <DeckCard style={{marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+            <div style={{width:4,height:18,background:P.gold,borderRadius:2}}/>
+            <span style={{fontSize:15,fontWeight:700,color:P.text}}>Form &amp; Practice — Group</span>
+            <span style={{fontSize:11,color:P.muted,marginLeft:4}}>All clinics combined</span>
+          </div>
+          <KPIStrip rows={groupRows} scope="__group"/>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <div>
+              <ChartLabel title="Annual Revenue" sub="All clinics · AUD"/>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={groupRows} barSize={36}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+                  <XAxis dataKey="fy" tick={{fill:P.muted,fontSize:11}} axisLine={false} tickLine={false}/>
+                  <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={56} axisLine={false} tickLine={false}/>
+                  <Tooltip content={<TT/>}/>
+                  <Bar dataKey="revenue" name="Revenue" radius={[4,4,0,0]}>
+                    {groupRows.map((r,i)=>(
+                      <Cell key={i} fill={r.ytd?`${P.blue}88`:P.blue}/>
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div>
+              <ChartLabel title="Annual Adj. EBITDA" sub="All clinics · AUD"/>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={groupRows} barSize={36}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+                  <XAxis dataKey="fy" tick={{fill:P.muted,fontSize:11}} axisLine={false} tickLine={false}/>
+                  <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={56} axisLine={false} tickLine={false}/>
+                  <Tooltip content={<TT/>}/>
+                  <Bar dataKey="adjEbitda" name="Adj. EBITDA ✓" radius={[4,4,0,0]}>
+                    {groupRows.map((r,i)=>(
+                      <Cell key={i} fill={r.ytd?`${P.gold}88`:P.gold}/>
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+          {/* EBITDA margin trend */}
+          <div style={{marginTop:16}}>
+            <ChartLabel title="EBITDA Margin % — Group" sub="Adj. EBITDA ÷ Revenue"/>
+            <ResponsiveContainer width="100%" height={100}>
+              <BarChart data={groupRows} barSize={36}>
+                <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+                <XAxis dataKey="fy" tick={{fill:P.muted,fontSize:11}} axisLine={false} tickLine={false}/>
+                <YAxis tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={36} axisLine={false} tickLine={false} domain={[0,'auto']}/>
+                <Tooltip formatter={v=>`${Number(v).toFixed(1)}%`}/>
+                <ReferenceLine y={15} stroke={P.green} strokeDasharray="4 4"/>
+                <ReferenceLine y={10} stroke={P.red}   strokeDasharray="4 4"/>
+                <Bar dataKey="margin" name="Margin %" radius={[4,4,0,0]}>
+                  {groupRows.map((r,i)=>(
+                    <Cell key={i} fill={r.margin>=15?P.green:r.margin>=10?P.gold:P.red} opacity={r.ytd?0.6:1}/>
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </DeckCard>
+
+        {/* ── PER-CLINIC SECTION ──────────────────────────── */}
+        {loadedClinics.map(c => {
+          const cr = clinicRows.find(x=>x.clinic===c);
+          if (!cr) return null;
+          const rows = cr.rows;
+          return (
+            <DeckCard key={c} style={{marginBottom:16}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+                <div style={{width:4,height:18,background:CC[c],borderRadius:2}}/>
+                <span style={{fontSize:15,fontWeight:700,color:CC[c]}}>{c}</span>
+              </div>
+              <KPIStrip rows={rows} scope={c}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+                <div>
+                  <ChartLabel title="Annual Revenue"/>
+                  <ResponsiveContainer width="100%" height={160}>
+                    <BarChart data={rows} barSize={32}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+                      <XAxis dataKey="fy" tick={{fill:P.muted,fontSize:11}} axisLine={false} tickLine={false}/>
+                      <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={56} axisLine={false} tickLine={false}/>
+                      <Tooltip content={<TT/>}/>
+                      <Bar dataKey="revenue" name="Revenue" radius={[4,4,0,0]}>
+                        {rows.map((r,i)=><Cell key={i} fill={r.ytd?`${CC[c]}77`:CC[c]}/>)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div>
+                  <ChartLabel title="Adj. EBITDA &amp; Margin %"/>
+                  <ResponsiveContainer width="100%" height={160}>
+                    <BarChart data={rows} barSize={32}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+                      <XAxis dataKey="fy" tick={{fill:P.muted,fontSize:11}} axisLine={false} tickLine={false}/>
+                      <YAxis yAxisId="$" tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={56} axisLine={false} tickLine={false}/>
+                      <YAxis yAxisId="%" orientation="right" tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={32} axisLine={false} tickLine={false}/>
+                      <Tooltip content={({active,payload,label})=>{
+                        if(!active||!payload?.length) return null;
+                        return <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:8,padding:"10px 14px"}}>
+                          <div style={{color:P.muted,fontSize:11,marginBottom:5}}>{label}</div>
+                          {payload.map(p=><div key={p.name} style={{color:p.color||P.text,fontSize:12,fontWeight:600}}>
+                            {p.name}: {p.name.includes("%")?`${Number(p.value).toFixed(1)}%`:fmtK(p.value)}
+                          </div>)}
+                        </div>;
+                      }}/>
+                      <Bar yAxisId="$" dataKey="adjEbitda" name="Adj. EBITDA" radius={[4,4,0,0]}>
+                        {rows.map((r,i)=><Cell key={i} fill={r.ytd?`${P.gold}77`:P.gold}/>)}
+                      </Bar>
+                      <Line yAxisId="%" type="monotone" dataKey="margin" name="Margin %" stroke={P.teal} strokeWidth={2} dot={{r:3,fill:P.teal}}/>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </DeckCard>
+          );
+        })}
+
+        {/* ── SUMMARY TABLE ──────────────────────────────── */}
+        <DeckCard style={{marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+            <div style={{width:4,height:18,background:P.teal,borderRadius:2}}/>
+            <span style={{fontSize:15,fontWeight:700,color:P.text}}>Summary Table</span>
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{borderBottom:`2px solid ${P.border}`}}>
+                  <th style={{padding:"8px 14px",textAlign:"left",color:P.muted,fontSize:10,textTransform:"uppercase",letterSpacing:1,minWidth:140}}>Entity</th>
+                  {[...fullYears,ytdYear].filter(Boolean).map(fy=>(
+                    <th key={fy} colSpan={2} style={{padding:"8px 14px",textAlign:"center",color:P.muted,fontSize:10,textTransform:"uppercase",letterSpacing:1}}>
+                      {fy}{fy===ytdYear?` (${ytdQCount}Q YTD)`:""}
+                    </th>
+                  ))}
+                </tr>
+                <tr style={{borderBottom:`1px solid ${P.border}`,background:P.alt}}>
+                  <th style={{padding:"6px 14px",textAlign:"left",color:P.dim,fontSize:10}}></th>
+                  {[...fullYears,ytdYear].filter(Boolean).flatMap(fy=>[
+                    <th key={fy+"r"} style={{padding:"6px 10px",textAlign:"right",color:P.dim,fontSize:10}}>Revenue</th>,
+                    <th key={fy+"e"} style={{padding:"6px 10px",textAlign:"right",color:P.dim,fontSize:10}}>Adj. EBITDA</th>,
+                  ])}
+                </tr>
+              </thead>
+              <tbody>
+                {[...loadedClinics,"__group"].map((scope,si)=>{
+                  const label = scope==="__group"?"Group Total":scope;
+                  const isGroup = scope==="__group";
+                  return (
+                    <tr key={scope} style={{borderBottom:`1px solid ${P.border}${isGroup?"":"22"}`,background:isGroup?`${P.gold}08`:"transparent",fontWeight:isGroup?700:400}}>
+                      <td style={{padding:"9px 14px",color:isGroup?P.gold:CC[scope]||P.text,fontWeight:600}}>{label}</td>
+                      {[...fullYears,ytdYear].filter(Boolean).flatMap(fy=>{
+                        const d = fyData[fy]?.[scope];
+                        const margin = d?.revenue ? (d.adjEbitda/d.revenue*100).toFixed(1) : null;
+                        return [
+                          <td key={fy+"r"} style={{padding:"9px 10px",textAlign:"right",color:P.text,fontVariantNumeric:"tabular-nums"}}>{d?fmtK(d.revenue):"—"}</td>,
+                          <td key={fy+"e"} style={{padding:"9px 10px",textAlign:"right",fontVariantNumeric:"tabular-nums"}}>
+                            {d?<span style={{color:d.adjEbitda>=0?P.gold:P.red}}>{fmtK(d.adjEbitda)} {margin?<span style={{fontSize:10,color:P.muted,fontWeight:400}}>({margin}%)</span>:null}</span>:"—"}
+                          </td>,
+                        ];
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{fontSize:10,color:P.dim,marginTop:12,lineHeight:1.7}}>
+            Adj. EBITDA adds back owner salary, owner superannuation, depreciation &amp; amortisation, and interest. Lighter bars indicate partial-year YTD figures. Green reference line = 15% margin, red = 10%.
+          </div>
+        </DeckCard>
+      </div>
+
+      <style>{`
+        @media print {
+          body { background: #ffffff !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          #annual-overview-print { padding: 0; }
+          button { display: none !important; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ─── Explorer ─────────────────────────────────────────────────────────────────
+const BUILT_IN_METRICS = [
+  { key:"revenue",     label:"Revenue",         section:"computed" },
+  { key:"grossProfit", label:"Gross Profit",     section:"computed" },
+  { key:"netProfit",   label:"Net Profit",       section:"computed" },
+  { key:"ebitda",      label:"EBITDA",           section:"computed" },
+  { key:"adjEbitda",   label:"Adj. EBITDA",      section:"computed" },
+  { key:"ebit",        label:"EBIT",             section:"computed", fn: m => m.ebitda - m.da },
+  { key:"ebitdaMargin",label:"EBITDA Margin %",  section:"computed", isPct:true },
+  { key:"gpMargin",    label:"GP Margin %",      section:"computed", isPct:true },
+  { key:"wageRatio",   label:"Wages % Revenue",  section:"computed", isPct:true },
+  { key:"wages",       label:"Wages (total)",    section:"computed" },
+  { key:"ownerSalary", label:"Owner Salary",     section:"computed" },
+  { key:"da",          label:"D&A",              section:"computed" },
+  { key:"interest",    label:"Interest",         section:"computed" },
+  { key:"otherIncome", label:"Other Income",     section:"computed" },
+  { key:"opex",        label:"Total OpEx",       section:"computed" },
+  { key:"cogs",        label:"Cost of Sales",    section:"computed" },
+];
+
+const DASH_PATTERNS = ["", "6 3", "2 2", "8 3 2 3", "4 1"];
+
+function getAcctVal(accounts, name) {
+  for (const a of Object.values(accounts)) {
+    if (a.name === name) return a.val;
+  }
+  return null;
+}
+
+function ExplorerView({ uploads, quarters, loadedClinics }) {
+  const [selMetrics,  setSelMetrics]  = useState(["revenue","adjEbitda"]);
+  const [selClinics,  setSelClinics]  = useState(loadedClinics.slice());
+  const [qFrom,       setQFrom]       = useState(quarters[0]||"");
+  const [qTo,         setQTo]         = useState(quarters[quarters.length-1]||"");
+  const [chartType,   setChartType]   = useState("line");
+  const [acctSearch,  setAcctSearch]  = useState("");
+  const [showAccounts,setShowAccounts]= useState(false);
+
+  const validClinics = selClinics.filter(c=>loadedClinics.includes(c));
+
+  const allAccounts = useMemo(()=>{
+    const bySection = { income:new Set(), cogs:new Set(), opex:new Set(), other:new Set() };
+    for (const d of uploads) {
+      for (const a of Object.values(d.accounts)) {
+        if (EXCLUDE_RX.some(r=>r.test(a.name))) continue;
+        if (bySection[a.section]) bySection[a.section].add(a.name);
+      }
+    }
+    return bySection;
+  },[uploads]);
+
+  const filteredAccounts = useMemo(()=>{
+    const q = acctSearch.toLowerCase();
+    const result = [];
+    const SEC_LABELS = {income:"Income",cogs:"Cost of Sales",opex:"Operating Expenses",other:"Other Income"};
+    for (const [sec, names] of Object.entries(allAccounts)) {
+      const filtered = [...names].filter(n=>!q||n.toLowerCase().includes(q)).sort();
+      if (filtered.length) result.push({section:SEC_LABELS[sec], names:filtered});
+    }
+    return result;
+  },[allAccounts, acctSearch]);
+
+  const filteredQ = useMemo(()=>{
+    const fi = quarters.indexOf(qFrom), ti = quarters.indexOf(qTo);
+    if (fi<0||ti<0) return quarters;
+    return quarters.slice(fi, ti+1);
+  },[quarters, qFrom, qTo]);
+
+  const series = useMemo(()=>{
+    const out = [];
+    let dashIdx = 0;
+    for (const mk of selMetrics) {
+      const built = BUILT_IN_METRICS.find(m=>m.key===mk);
+      const isAcct = mk.startsWith("acct:");
+      const acctName = isAcct ? mk.slice(5) : null;
+      const isPct = built?.isPct||false;
+      const dash = DASH_PATTERNS[dashIdx % DASH_PATTERNS.length];
+      dashIdx++;
+      for (const cl of validClinics) {
+        const color = CC[cl]||P.blue;
+        const metricLabel = isAcct ? acctName : (built?.label||mk);
+        const label = validClinics.length>1 ? `${cl} · ${metricLabel}` : metricLabel;
+        out.push({ id:`${cl}__${mk}`, label, clinic:cl, metricKey:mk, isPct, isAcct, acctName, builtFn:built?.fn||null, color, dash });
+      }
+    }
+    return out;
+  },[selMetrics, validClinics]);
+
+  const chartData = useMemo(()=>filteredQ.map(q=>{
+    const row = { quarter:q };
+    for (const s of series) {
+      const d = uploads.find(u=>u.clinic===s.clinic&&u.quarter===q);
+      if (!d) { row[s.id]=null; continue; }
+      if (s.isAcct) {
+        row[s.id] = getAcctVal(d.accounts, s.acctName);
+      } else {
+        const m = computeMetrics(d.accounts, s.clinic);
+        row[s.id] = s.builtFn ? s.builtFn(m) : m[s.metricKey];
+      }
+    }
+    return row;
+  }),[filteredQ, series, uploads]);
+
+  const hasPct    = series.some(s=>s.isPct);
+  const hasDollar = series.some(s=>!s.isPct);
+  const toggleMetric = mk => setSelMetrics(p=>p.includes(mk)?p.filter(x=>x!==mk):[...p,mk]);
+  const toggleClinic = c  => setSelClinics(p=>p.includes(c)?p.filter(x=>x!==c):[...p,c]);
+
+  const Chip = ({label,active,color,onClick})=>(
+    <button onClick={onClick} style={{background:active?`${color}22`:"transparent",border:`1px solid ${active?color:P.border}`,color:active?color:P.muted,borderRadius:20,padding:"4px 12px",cursor:"pointer",fontSize:12,transition:"all 0.15s",whiteSpace:"nowrap"}}>
+      {label}
+    </button>
+  );
+  const MetricChip = ({mk,label})=>{
+    const active = selMetrics.includes(mk);
+    return <Chip label={label} active={active} color={P.teal} onClick={()=>toggleMetric(mk)}/>;
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:600,color:P.text,marginBottom:3}}>Data Explorer</div>
+          <div style={{fontSize:12,color:P.muted}}>Chart any metric or account · any clinic combination · any date range</div>
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          {["line","bar"].map(t=>(
+            <button key={t} onClick={()=>setChartType(t)} style={{background:chartType===t?P.alt:"transparent",border:`1px solid ${chartType===t?P.border:P.dim}`,color:chartType===t?P.text:P.muted,borderRadius:7,padding:"6px 14px",cursor:"pointer",fontSize:12}}>
+              {t==="line"?"Line Chart":"Bar Chart"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 16px"}}>
+          <div style={{fontSize:10,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2,marginBottom:10}}>Clinics</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {loadedClinics.map(c=>(
+              <Chip key={c} label={c} active={validClinics.includes(c)} color={CC[c]} onClick={()=>toggleClinic(c)}/>
+            ))}
+            {loadedClinics.length>1&&(
+              <Chip label="All" active={validClinics.length===loadedClinics.length} color={P.gold}
+                onClick={()=>setSelClinics(validClinics.length===loadedClinics.length?[]:loadedClinics.slice())}/>
+            )}
+          </div>
+        </div>
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 16px"}}>
+          <div style={{fontSize:10,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2,marginBottom:10}}>Quarter Range</div>
+          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <select value={qFrom} onChange={e=>setQFrom(e.target.value)} style={{background:P.alt,border:`1px solid ${P.border}`,color:P.text,borderRadius:6,padding:"6px 10px",fontSize:12,flex:1}}>
+              {quarters.map(q=><option key={q} value={q}>{q}</option>)}
+            </select>
+            <span style={{color:P.muted,fontSize:12}}>to</span>
+            <select value={qTo} onChange={e=>setQTo(e.target.value)} style={{background:P.alt,border:`1px solid ${P.border}`,color:P.text,borderRadius:6,padding:"6px 10px",fontSize:12,flex:1}}>
+              {quarters.map(q=><option key={q} value={q}>{q}</option>)}
+            </select>
+            <span style={{fontSize:11,color:P.dim,whiteSpace:"nowrap"}}>{filteredQ.length}Q</span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 16px",marginBottom:18}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <div style={{fontSize:10,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2}}>Metrics &amp; Accounts</div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            {selMetrics.length>0&&<span style={{fontSize:11,color:P.teal}}>{selMetrics.length} selected</span>}
+            {selMetrics.length>0&&<button onClick={()=>setSelMetrics([])} style={{background:"none",border:"none",color:P.muted,cursor:"pointer",fontSize:11,padding:0}}>Clear all</button>}
+          </div>
+        </div>
+        <div style={{fontSize:10,color:P.dim,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Computed Metrics</div>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:12}}>
+          {BUILT_IN_METRICS.map(m=><MetricChip key={m.key} mk={m.key} label={m.label}/>)}
+        </div>
+        <div style={{fontSize:10,color:P.dim,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>Individual Accounts</div>
+        <div style={{display:"flex",gap:8,marginBottom:8}}>
+          <input value={acctSearch} onChange={e=>setAcctSearch(e.target.value)}
+            placeholder="Search accounts e.g. physio, reformer, wages, cleaning..."
+            style={{flex:1,background:P.alt,border:`1px solid ${P.border}`,color:P.text,borderRadius:6,padding:"7px 12px",fontSize:12,outline:"none"}}/>
+          <button onClick={()=>setShowAccounts(s=>!s)} style={{background:P.alt,border:`1px solid ${P.border}`,color:P.muted,borderRadius:6,padding:"7px 14px",cursor:"pointer",fontSize:12}}>
+            {showAccounts?"Hide":"Browse"}
+          </button>
+        </div>
+        {(showAccounts||acctSearch)&&(
+          <div style={{maxHeight:220,overflowY:"auto",border:`1px solid ${P.border}`,borderRadius:8,background:P.alt}}>
+            {filteredAccounts.length===0&&<div style={{padding:"12px 16px",color:P.muted,fontSize:12}}>No accounts match.</div>}
+            {filteredAccounts.map(group=>(
+              <div key={group.section}>
+                <div style={{padding:"6px 14px",fontSize:9,color:P.dim,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1,background:P.bg,position:"sticky",top:0}}>{group.section}</div>
+                {group.names.map(name=>{
+                  const mk=`acct:${name}`;
+                  const active=selMetrics.includes(mk);
+                  return (
+                    <div key={name} onClick={()=>toggleMetric(mk)}
+                      style={{padding:"7px 14px",cursor:"pointer",fontSize:12,color:active?P.teal:P.text,background:active?`${P.teal}12`:"transparent",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${P.border}14`}}>
+                      <span>{name}</span>
+                      {active&&<span style={{fontSize:10,color:P.teal}}>✓</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+        {selMetrics.filter(m=>m.startsWith("acct:")).length>0&&(
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:8}}>
+            {selMetrics.filter(m=>m.startsWith("acct:")).map(mk=>(
+              <div key={mk} style={{display:"flex",alignItems:"center",gap:5,background:`${P.teal}18`,border:`1px solid ${P.teal}44`,borderRadius:20,padding:"3px 10px",fontSize:12,color:P.teal}}>
+                <span>{mk.slice(5)}</span>
+                <span onClick={()=>toggleMetric(mk)} style={{cursor:"pointer",opacity:0.6,lineHeight:1}}>×</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {series.length===0||validClinics.length===0?(
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"40px",textAlign:"center",color:P.muted,fontSize:13}}>
+          Select at least one metric and one clinic above.
+        </div>
+      ):(
+        <>
+          <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+            <div style={{fontSize:11,color:P.muted,paddingLeft:8,marginBottom:4}}>{filteredQ[0]} – {filteredQ[filteredQ.length-1]} · {filteredQ.length} quarters · {series.length} series</div>
+            <ResponsiveContainer width="100%" height={Math.max(280, 60+series.length*18)}>
+              {chartType==="bar"?(
+                <BarChart data={chartData} barCategoryGap="18%">
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                  <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={Math.max(0,Math.floor(filteredQ.length/10)-1)}/>
+                  {hasDollar&&<YAxis yAxisId="$" tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>}
+                  {hasPct&&<YAxis yAxisId="%" orientation="right" tickFormatter={v=>`${Number(v).toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40}/>}
+                  <Tooltip content={({active,payload,label})=>{
+                    if(!active||!payload?.length) return null;
+                    return <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:8,padding:"10px 14px"}}>
+                      <div style={{color:P.muted,fontSize:11,marginBottom:6}}>{label}</div>
+                      {payload.filter(p=>p.value!=null).map(p=>{
+                        const s=series.find(x=>x.id===p.dataKey);
+                        return <div key={p.dataKey} style={{color:p.fill,fontSize:12,fontWeight:600,marginBottom:2}}>
+                          {p.name}: {s?.isPct?`${Number(p.value).toFixed(1)}%`:fmtK(p.value)}
+                        </div>;
+                      })}
+                    </div>;
+                  }}/>
+                  <Legend/>
+                  {series.map((s,i)=>(
+                    <Bar key={s.id} dataKey={s.id} name={s.label} fill={s.color} yAxisId={s.isPct?"%":"$"} opacity={0.75+(i%3)*0.08}/>
+                  ))}
+                </BarChart>
+              ):(
+                <LineChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                  <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={Math.max(0,Math.floor(filteredQ.length/10)-1)}/>
+                  {hasDollar&&<YAxis yAxisId="$" tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>}
+                  {hasPct&&<YAxis yAxisId="%" orientation="right" tickFormatter={v=>`${Number(v).toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40}/>}
+                  <Tooltip content={({active,payload,label})=>{
+                    if(!active||!payload?.length) return null;
+                    return <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:8,padding:"10px 14px",maxWidth:300}}>
+                      <div style={{color:P.muted,fontSize:11,marginBottom:6}}>{label}</div>
+                      {payload.filter(p=>p.value!=null).map(p=>{
+                        const s=series.find(x=>x.id===p.dataKey);
+                        return <div key={p.dataKey} style={{color:p.color,fontSize:12,fontWeight:600,marginBottom:2}}>
+                          {p.name}: {s?.isPct?`${Number(p.value).toFixed(1)}%`:fmtK(p.value)}
+                        </div>;
+                      })}
+                    </div>;
+                  }}/>
+                  <Legend/>
+                  <ReferenceLine yAxisId="$" y={0} stroke={P.dim} strokeDasharray="3 3"/>
+                  {series.map(s=>(
+                    <Line key={s.id} type="monotone" dataKey={s.id} name={s.label}
+                      stroke={s.color} strokeWidth={2} strokeDasharray={s.dash}
+                      yAxisId={s.isPct?"%":"$"} dot={{r:2,fill:s.color}} connectNulls/>
+                  ))}
+                </LineChart>
+              )}
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,overflow:"auto",marginBottom:16}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:500}}>
+              <thead>
+                <tr style={{borderBottom:`1px solid ${P.border}`,background:P.alt}}>
+                  <th style={{padding:"8px 12px",textAlign:"left",color:P.muted,fontSize:10,textTransform:"uppercase",position:"sticky",left:0,background:P.alt,minWidth:180}}>Series</th>
+                  {filteredQ.map(q=><th key={q} style={{padding:"8px 10px",textAlign:"right",color:P.muted,fontSize:10,whiteSpace:"nowrap"}}>{q}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {series.map((s,i)=>(
+                  <tr key={s.id} style={{borderBottom:`1px solid ${P.border}14`,background:i%2?`${P.alt}60`:"transparent"}}>
+                    <td style={{padding:"7px 12px",color:s.color,fontWeight:600,position:"sticky",left:0,background:i%2?P.alt:P.surface,fontSize:11}}>{s.label}</td>
+                    {filteredQ.map(q=>{
+                      const v=chartData.find(r=>r.quarter===q)?.[s.id];
+                      return <td key={q} style={{padding:"7px 10px",textAlign:"right",color:v==null?P.dim:(v<0?P.red:P.text),fontVariantNumeric:"tabular-nums"}}>
+                        {v==null?"—":s.isPct?`${Number(v).toFixed(1)}%`:fmtK(v)}
+                      </td>;
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+// ─── Pin Gate (Owner Mode) ────────────────────────────────────────────────────
+function PinGate({ownerMode, onToggle}) {
+  const [show, setShow] = useState(false);
+  const [pin,  setPin]  = useState("");
+  const [err,  setErr]  = useState(false);
+  const OWNER_PIN = localStorage.getItem("fp_owner_pin")||"1234";
+  const tryPin = () => {
+    if (pin === OWNER_PIN) { onToggle(true); setShow(false); setPin(""); setErr(false); }
+    else { setErr(true); setPin(""); }
+  };
+  if (ownerMode) return (
+    <button onClick={()=>onToggle(false)}
+      style={{background:`${P.gold}22`,border:`1px solid ${P.gold}`,color:P.gold,borderRadius:7,padding:"6px 13px",cursor:"pointer",fontSize:11,fontWeight:600}}>
+      🔓 Owner Mode
+    </button>
+  );
+  return (
+    <div style={{position:"relative"}}>
+      <button onClick={()=>setShow(s=>!s)}
+        style={{background:"transparent",border:`1px solid ${P.border}`,color:P.muted,borderRadius:7,padding:"6px 13px",cursor:"pointer",fontSize:11}}>
+        🔒 Owner Mode
+      </button>
+      {show&&(
+        <div style={{position:"absolute",right:0,top:"110%",background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:16,zIndex:50,minWidth:220,boxShadow:"0 8px 32px #00000066"}}>
+          <div style={{fontSize:12,color:P.muted,marginBottom:10}}>Enter PIN to unlock owner view</div>
+          <input type="password" value={pin} onChange={e=>setPin(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&tryPin()}
+            placeholder="PIN" autoFocus
+            style={{width:"100%",background:P.alt,border:`1px solid ${err?P.red:P.border}`,color:P.text,borderRadius:6,padding:"8px 12px",fontSize:14,outline:"none",boxSizing:"border-box"}}/>
+          {err&&<div style={{fontSize:11,color:P.red,marginTop:4}}>Incorrect PIN</div>}
+          <button onClick={tryPin} style={{marginTop:10,width:"100%",background:P.gold,border:"none",color:P.bg,borderRadius:6,padding:"8px",cursor:"pointer",fontWeight:700,fontSize:13}}>Unlock</button>
+          <div style={{fontSize:10,color:P.dim,marginTop:8,textAlign:"center"}}>Default PIN: 1234 — change in browser console:<br/><code style={{color:P.muted}}>localStorage.setItem("fp_owner_pin","XXXX")</code></div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Break-Even Calculator ────────────────────────────────────────────────────
+function BreakevenCalc({clinicName, latestMetrics}) {
+  const saved = JSON.parse(localStorage.getItem("fp_be_"+(clinicName||"new"))||"{}");
+  const [fixedCosts, setFixed]  = useState(saved.fixed||30000);
+  const [varPct,     setVar]    = useState(saved.varPct||25);
+  const [targetProfit, setTP]   = useState(saved.tp||0);
+  const [clinicN,    setClinicN]= useState(clinicName||"New Clinic");
+
+  const save = () => localStorage.setItem("fp_be_"+(clinicName||"new"), JSON.stringify({fixed:fixedCosts,varPct,tp:targetProfit}));
+
+  // Break-even revenue = Fixed Costs / (1 - variable cost %)
+  const varDec  = varPct / 100;
+  const bev     = varDec < 1 ? fixedCosts / (1 - varDec) : null;
+  const bevTarget = varDec < 1 ? (fixedCosts + targetProfit) / (1 - varDec) : null;
+  const bevMonthly = bev ? bev / 3 : null;  // quarterly → monthly
+  const bevTargetMonthly = bevTarget ? bevTarget / 3 : null;
+
+  const currentRev = latestMetrics?.revenue || null;
+  const pctOfBE = bev && currentRev ? (currentRev / bev) * 100 : null;
+
+  const Inp = ({label, value, onChange, prefix="$", suffix="", min=0, step=1000}) => (
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:10,color:P.muted,textTransform:"uppercase",letterSpacing:1,fontFamily:"monospace",marginBottom:5}}>{label}</div>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {prefix&&<span style={{color:P.muted,fontSize:13}}>{prefix}</span>}
+        <input type="number" value={value} onChange={e=>onChange(Number(e.target.value))} min={min} step={step}
+          style={{background:P.alt,border:`1px solid ${P.border}`,color:P.text,borderRadius:6,padding:"8px 12px",fontSize:14,width:"100%",outline:"none"}}/>
+        {suffix&&<span style={{color:P.muted,fontSize:13}}>{suffix}</span>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:600,color:P.text,marginBottom:3}}>Break-Even Calculator</div>
+          <div style={{fontSize:12,color:P.muted}}>Per quarter · Useful for new and startup clinics</div>
+        </div>
+        <button onClick={save} style={{background:`${P.green}22`,border:`1px solid ${P.green}44`,color:P.green,borderRadius:7,padding:"7px 14px",cursor:"pointer",fontSize:12}}>Save inputs</button>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+        {/* Inputs */}
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"20px 22px"}}>
+          <div style={{fontSize:10,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2,marginBottom:16}}>Inputs — Quarterly</div>
+          <Inp label="Total Fixed Costs (wages, rent, insurance, etc)" value={fixedCosts} onChange={setFixed} step={500}/>
+          <Inp label="Variable Costs as % of Revenue (COGS, supplies)" value={varPct} onChange={v=>setVar(Math.min(99,v))} prefix="" suffix="%" step={1} min={0}/>
+          <Inp label="Target Profit (quarterly, optional)" value={targetProfit} onChange={setTP} step={500}/>
+          <div style={{fontSize:11,color:P.dim,marginTop:8,lineHeight:1.6}}>
+            Variable costs are expenses that scale with revenue — COGS, consumables, reception staff on casual hours. Fixed costs are everything else.
+          </div>
+        </div>
+
+        {/* Results */}
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {[
+            {label:"Break-Even Revenue (quarterly)", val:bev?fmtK(bev):"—", color:P.text, sub:"to cover all costs at zero profit"},
+            {label:"Monthly Revenue Target", val:bevMonthly?fmtK(bevMonthly):"—", color:P.blue, sub:"to give to your clinic manager"},
+            {label:"Break-Even + Target Profit", val:bevTarget?fmtK(bevTarget):"—", color:P.gold, sub:`includes $${(targetProfit/1000).toFixed(0)}k profit target`},
+            {label:"Monthly Target incl. Profit", val:bevTargetMonthly?fmtK(bevTargetMonthly):"—", color:P.goldL, sub:"clinic manager monthly target"},
+          ].map((k,i)=>(
+            <div key={i} style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>{k.label}</div>
+              <div style={{fontSize:22,fontWeight:700,color:k.color,fontFamily:"'DM Serif Display',serif"}}>{k.val}</div>
+              <div style={{fontSize:11,color:P.muted,marginTop:2}}>{k.sub}</div>
+            </div>
+          ))}
+          {pctOfBE!==null&&(
+            <div style={{background:P.surface,border:`1px solid ${pctOfBE>=100?P.green:P.gold}44`,borderRadius:10,padding:"14px 18px"}}>
+              <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Current Quarter vs Break-Even</div>
+              <div style={{fontSize:22,fontWeight:700,color:pctOfBE>=100?P.green:P.gold,fontFamily:"'DM Serif Display',serif"}}>{pctOfBE.toFixed(0)}%</div>
+              <div style={{height:6,background:P.dim,borderRadius:3,marginTop:8,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${Math.min(100,pctOfBE)}%`,background:pctOfBE>=100?P.green:P.gold,borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <div style={{fontSize:11,color:P.muted,marginTop:4}}>{fmtK(currentRev)} actual vs {bev?fmtK(bev):""} break-even</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Targets View (Ben) ───────────────────────────────────────────────────────
+function TargetsView({uploads, quarters, loadedClinics}) {
+  const LS_KEY = "fp_targets";
+  const loadTargets = () => { try { return JSON.parse(localStorage.getItem(LS_KEY)||"{}"); } catch { return {}; } };
+  const [targets, setTargets] = useState(loadTargets);
+  const [edited, setEdited] = useState(false);
+
+  const setTarget = (clinic, quarter, field, val) => {
+    setTargets(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (!next[clinic]) next[clinic] = {};
+      if (!next[clinic][quarter]) next[clinic][quarter] = {};
+      next[clinic][quarter][field] = val;
+      return next;
+    });
+    setEdited(true);
+  };
+
+  const save = () => { localStorage.setItem(LS_KEY, JSON.stringify(targets)); setEdited(false); };
+
+  // Show last 6 quarters
+  const shownQ = quarters.slice(-6);
+  const fields = [{key:"revenue",label:"Revenue Target",color:P.blue},{key:"adjEbitda",label:"EBITDA Target",color:P.gold}];
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:600,color:P.text,marginBottom:3}}>Quarterly Targets</div>
+          <div style={{fontSize:12,color:P.muted}}>Set revenue and EBITDA targets per clinic · compares against actuals</div>
+        </div>
+        <button onClick={save} style={{background:edited?`${P.green}22`:`${P.dim}44`,border:`1px solid ${edited?P.green:P.dim}`,color:edited?P.green:P.muted,borderRadius:7,padding:"7px 16px",cursor:"pointer",fontSize:12,fontWeight:600}}>
+          {edited?"● Save Targets":"Saved ✓"}
+        </button>
+      </div>
+
+      {loadedClinics.map(clinic=>(
+        <div key={clinic} style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,marginBottom:16,overflow:"hidden"}}>
+          <div style={{background:P.alt,padding:"12px 18px",borderBottom:`1px solid ${P.border}`,display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:10,height:10,borderRadius:"50%",background:CC[clinic]}}/>
+            <span style={{fontWeight:600,color:CC[clinic],fontSize:14}}>{clinic}</span>
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{borderBottom:`1px solid ${P.border}`,background:P.alt}}>
+                  <th style={{padding:"9px 16px",textAlign:"left",color:P.muted,fontSize:10,textTransform:"uppercase",minWidth:140}}>Metric</th>
+                  {shownQ.map(q=><th key={q} style={{padding:"9px 12px",textAlign:"center",color:P.muted,fontSize:10,whiteSpace:"nowrap",minWidth:130}}>{q}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {fields.map(({key,label,color})=>{
+                  return [
+                    <tr key={key+"t"} style={{borderBottom:`1px solid ${P.border}0a`,background:`${P.alt}44`}}>
+                      <td style={{padding:"8px 16px",color:color,fontWeight:600,fontSize:11}}>{label}</td>
+                      {shownQ.map(q=>{
+                        const tgt = targets[clinic]?.[q]?.[key]||"";
+                        return <td key={q} style={{padding:"6px 8px"}}>
+                          <input type="number" value={tgt} onChange={e=>setTarget(clinic,q,key,Number(e.target.value)||"")}
+                            placeholder="—"
+                            style={{width:"100%",background:P.alt,border:`1px solid ${P.border}`,color:color,borderRadius:5,padding:"5px 8px",fontSize:12,textAlign:"right",outline:"none",fontVariantNumeric:"tabular-nums"}}/>
+                        </td>;
+                      })}
+                    </tr>,
+                    <tr key={key+"a"} style={{borderBottom:`1px solid ${P.border}22`}}>
+                      <td style={{padding:"8px 16px",color:P.muted,fontSize:11}}>↳ Actual</td>
+                      {shownQ.map(q=>{
+                        const d = uploads.find(u=>u.clinic===clinic&&u.quarter===q);
+                        const actual = d ? computeMetrics(d.accounts,clinic)[key] : null;
+                        const tgt = targets[clinic]?.[q]?.[key]||null;
+                        const pct = (actual!=null&&tgt) ? (actual/tgt*100) : null;
+                        const col = pct==null?P.muted:pct>=100?P.green:pct>=85?P.gold:P.red;
+                        return <td key={q} style={{padding:"6px 12px",textAlign:"right",color:col,fontVariantNumeric:"tabular-nums",fontSize:12,fontWeight:pct!=null?600:400}}>
+                          {actual!=null?fmtK(actual):"—"}
+                          {pct!=null&&<span style={{fontSize:9,marginLeft:4,opacity:0.8}}>{pct.toFixed(0)}%</span>}
+                        </td>;
+                      })}
+                    </tr>,
+                  ];
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+      <div style={{fontSize:11,color:P.dim,lineHeight:1.7}}>
+        Targets are saved in this browser's local storage — they persist when you reload the page. % shown next to actuals = actual ÷ target. Green ≥ 100%, amber ≥ 85%, red below.
+      </div>
+    </div>
+  );
+}
+
+
+// ─── Cash Manager Parser ─────────────────────────────────────────────────────
+// Parses Xero Cash Flow Manager Overview export
+// Format: Date | Relative date | Opening balance | Cash in | Cash out | Net movement | Closing balance
+function parseXeroCashManager(arrayBuf) {
+  const wb   = XLSX.read(new Uint8Array(arrayBuf), {type:"array"});
+  const ws   = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+
+  // Detect clinic from row 1
+  let clinic = null;
+  for (let i=0; i<4; i++) {
+    for (const cell of (rows[i]||[])) {
+      const c = detectClinic(cell); if (c) { clinic=c; break; }
+    }
+    if (clinic) break;
+  }
+
+  // Find header row (has "Date" in col 0)
+  let hdr = -1;
+  for (let i=0; i<rows.length; i++) {
+    if (String(rows[i]?.[0]||"").trim().toLowerCase()==="date") { hdr=i; break; }
+  }
+  if (hdr===-1) return null;
+
+  const days = [];
+  for (let ri=hdr+1; ri<rows.length; ri++) {
+    const row = rows[ri];
+    if (!row || !row[0]) continue;
+
+    // Parse date — Xero exports as Excel serial or "DD Mon YYYY" string
+    let dateStr = null;
+    const raw = row[0];
+    if (typeof raw === "number") {
+      // Excel serial date
+      const d = new Date(Math.round((raw - 25569) * 86400 * 1000));
+      dateStr = d.toISOString().slice(0,10);
+    } else if (typeof raw === "string") {
+      const m = raw.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+      if (m) {
+        const months = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+        const mo = months[m[2].slice(0,3)];
+        if (mo!==undefined) dateStr = `${m[3]}-${String(mo+1).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+      }
+    } else if (raw instanceof Date) {
+      dateStr = raw.toISOString().slice(0,10);
+    }
+    if (!dateStr) continue;
+
+    const relLabel  = String(row[1]||"");
+    const openBal   = typeof row[2]==="number" ? row[2] : 0;
+    const cashIn    = typeof row[3]==="number" ? row[3] : 0;
+    const cashOut   = typeof row[4]==="number" ? row[4] : 0;
+    const netMove   = typeof row[5]==="number" ? row[5] : (cashIn - cashOut);
+    const closeBal  = typeof row[6]==="number" ? row[6] : (openBal + netMove);
+    const isToday   = /today/i.test(relLabel);
+
+    days.push({ date:dateStr, relLabel, openBal, cashIn, cashOut, netMove, closeBal, isToday });
+  }
+
+  return { clinic: clinic||"Unknown", days };
+}
+
+// ─── Cash Flow View ───────────────────────────────────────────────────────────
+function CashFlowView({cfUploads, loadedClinics}) {
+  const [fwdDays,    setFwdDays]   = useState(30);
+  const [viewMode,   setViewMode]  = useState("combined"); // "combined"|"clinics"
+  const [chBalance,  setChBalance] = useState(()=>Number(localStorage.getItem("fp_ch_bal")||16873));
+  const [showChInput,setShowChInput]= useState(false);
+
+  const saveChBal = v => { setChBalance(v); localStorage.setItem("fp_ch_bal",v); };
+
+  // Find today row (date === today or isToday flag)
+  const todayStr = new Date().toISOString().slice(0,10);
+
+  // Build combined daily data
+  const combined = useMemo(()=>{
+    if (cfUploads.length===0) return [];
+    // Get all unique dates
+    const allDates = [...new Set(cfUploads.flatMap(cf=>cf.days.map(d=>d.date)))].sort();
+    return allDates.map(date=>{
+      let totalIn=0, totalOut=0, totalClose=0, totalOpen=0;
+      const byClinic = {};
+      let bigOutflow = false;
+      for (const cf of cfUploads) {
+        const day = cf.days.find(d=>d.date===date);
+        if (day) {
+          totalIn    += day.cashIn;
+          totalOut   += day.cashOut;
+          totalClose += day.closeBal;
+          totalOpen  += day.openBal;
+          byClinic[cf.clinic] = day;
+          if (day.cashOut > 5000) bigOutflow = true;
+        }
+      }
+      // Add Chirnside if missing but we have a manual balance for offset
+      const hasCh = cfUploads.some(cf=>cf.clinic==="Chirnside Park");
+      if (!hasCh) {
+        // Use the screenshot balance as today's known value; project flat (no other data)
+        totalClose += chBalance;
+      }
+      const isToday = date === todayStr || cfUploads.some(cf=>cf.days.find(d=>d.date===date&&d.isToday));
+      return { date, totalIn, totalOut, totalClose, totalOpen, byClinic, isToday, bigOutflow };
+    });
+  },[cfUploads, chBalance, todayStr]);
+
+  // Slice to today + fwdDays
+  const todayIdx  = combined.findIndex(d=>d.isToday||d.date>=todayStr);
+  const startIdx  = Math.max(0, todayIdx-7); // show 1 week of actuals before today
+  const endIdx    = Math.min(combined.length-1, todayIdx + fwdDays);
+  const chartData = combined.slice(startIdx, endIdx+1).map(d=>({
+    ...d,
+    label: new Date(d.date+"T00:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short"}),
+    isFuture: d.date > todayStr,
+  }));
+
+  // KPI numbers
+  const todayRow   = combined.find(d=>d.isToday||d.date===todayStr);
+  const fwdRow     = combined[Math.min(combined.length-1, todayIdx+fwdDays)];
+  const next7      = combined.slice(todayIdx, todayIdx+7);
+  const next7net   = next7.reduce((s,d)=>s+d.totalIn-d.totalOut,0);
+  const hasCh      = cfUploads.some(cf=>cf.clinic==="Chirnside Park");
+  const clinicToday = (c) => {
+    if (c==="Chirnside Park" && !hasCh) return chBalance;
+    const cf = cfUploads.find(x=>x.clinic===c);
+    return cf?.days.find(d=>d.isToday||d.date===todayStr)?.closeBal || 0;
+  };
+  const minFwd     = chartData.filter(d=>d.isFuture).reduce((m,d)=>Math.min(m,d.totalClose), Infinity);
+
+  if (cfUploads.length===0) return (
+    <div>
+      <div style={{display:"flex",alignItems:"flex-start",gap:20,background:P.surface,border:`1px solid ${P.border}`,borderRadius:14,padding:"28px 32px",marginBottom:20}}>
+        <div style={{fontSize:32}}>💵</div>
+        <div>
+          <div style={{fontSize:15,fontWeight:600,color:P.text,marginBottom:8}}>Drop your Xero Cash Flow Manager exports here</div>
+          <div style={{fontSize:13,color:P.muted,lineHeight:1.9,marginBottom:12}}>
+            In Xero for each clinic:<br/>
+            <strong style={{color:P.text}}>Accounting → Cash Flow Manager</strong> → set to 30 or 90 days<br/>
+            Click <strong style={{color:P.text}}>Export → New (Excel)</strong> — the "New" button next to Export<br/>
+            Name each file with the clinic name and "cash" e.g. <code style={{color:P.teal}}>MtEvelyn-cash.xlsx</code><br/>
+            Drop all three here — the dashboard combines them into one view
+          </div>
+          <div style={{fontSize:11,color:P.dim}}>Files are detected automatically by the word "cash" in the filename.</div>
+        </div>
+      </div>
+      {/* Chirnside manual balance input */}
+      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"16px 20px"}}>
+        <div style={{fontSize:12,color:P.muted,marginBottom:8}}>If Chirnside Park file is unavailable, enter today's balance manually:</div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <input type="number" value={chBalance} onChange={e=>saveChBal(Number(e.target.value))}
+            style={{background:P.alt,border:`1px solid ${P.border}`,color:P.text,borderRadius:6,padding:"7px 12px",fontSize:14,width:140,outline:"none"}}/>
+          <span style={{fontSize:11,color:P.dim}}>Saved locally · used as static offset in combined view</span>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:600,color:P.text,marginBottom:3}}>Cash Flow Manager</div>
+          <div style={{fontSize:12,color:P.muted}}>
+            {cfUploads.map(cf=>cf.clinic).join(" · ")}
+            {!hasCh&&<span style={{color:P.gold}}> · Chirnside ${chBalance.toLocaleString()} (manual)</span>}
+            {" · "}combined view
+          </div>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <span style={{fontSize:11,color:P.muted}}>Show ahead:</span>
+          {[7,14,30,60,90].map(d=>(
+            <button key={d} onClick={()=>setFwdDays(d)}
+              style={{background:fwdDays===d?`${P.teal}22`:"transparent",border:`1px solid ${fwdDays===d?P.teal:P.border}`,color:fwdDays===d?P.teal:P.muted,borderRadius:6,padding:"5px 11px",cursor:"pointer",fontSize:11}}>
+              {d}d
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* KPI strip */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12,marginBottom:20}}>
+        {/* Per-clinic today */}
+        {["Mt Evelyn","Olinda","Chirnside Park"].map(c=>{
+          const bal = clinicToday(c);
+          const isMissing = c==="Chirnside Park" && !hasCh;
+          return (
+            <div key={c} style={{background:P.surface,border:`1px solid ${CC[c]}44`,borderRadius:10,padding:"13px 16px"}}>
+              <div style={{fontSize:9,color:CC[c],textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>{c}</div>
+              <div style={{fontSize:18,fontWeight:700,color:P.text,fontFamily:"'DM Serif Display',serif"}}>{fmtK(bal)}</div>
+              <div style={{fontSize:10,color:P.muted,marginTop:2}}>today{isMissing?" (manual)":""}</div>
+            </div>
+          );
+        })}
+        {/* Combined */}
+        <div style={{background:P.surface,border:`1px solid ${P.gold}44`,borderRadius:10,padding:"13px 16px"}}>
+          <div style={{fontSize:9,color:P.gold,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Group Total Today</div>
+          <div style={{fontSize:22,fontWeight:700,color:P.gold,fontFamily:"'DM Serif Display',serif"}}>{fmtK(todayRow?.totalClose||0)}</div>
+        </div>
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"13px 16px"}}>
+          <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Next 7 Days Net</div>
+          <div style={{fontSize:22,fontWeight:700,color:next7net>=0?P.green:P.red,fontFamily:"'DM Serif Display',serif"}}>{next7net>=0?"+":""}{fmtK(next7net)}</div>
+        </div>
+        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"13px 16px"}}>
+          <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Balance in {fwdDays}d</div>
+          <div style={{fontSize:22,fontWeight:700,color:P.teal,fontFamily:"'DM Serif Display',serif"}}>{fmtK(fwdRow?.totalClose||0)}</div>
+        </div>
+        {minFwd < Infinity && (
+          <div style={{background:P.surface,border:`1px solid ${minFwd<15000?P.red:minFwd<30000?P.gold:P.border}`,borderRadius:10,padding:"13px 16px"}}>
+            <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Lowest Group Balance</div>
+            <div style={{fontSize:22,fontWeight:700,color:minFwd<15000?P.red:minFwd<30000?P.gold:P.text,fontFamily:"'DM Serif Display',serif"}}>{fmtK(minFwd)}</div>
+            <div style={{fontSize:10,color:P.muted,marginTop:2}}>next {fwdDays} days</div>
+          </div>
+        )}
+        {/* Per-clinic low balance warnings */}
+        {cfUploads.map(cf=>{
+          const futureDays = cf.days.filter(d=>d.date>todayStr).slice(0,fwdDays);
+          if (!futureDays.length) return null;
+          const minBal = Math.min(...futureDays.map(d=>d.closeBal));
+          const minDay = futureDays.find(d=>d.closeBal===minBal);
+          if (minBal > 5000) return null;
+          return (
+            <div key={cf.clinic} style={{background:P.surface,border:`1px solid ${minBal<2000?P.red:P.gold}`,borderRadius:10,padding:"13px 16px"}}>
+              <div style={{fontSize:9,color:CC[cf.clinic],textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>{cf.clinic} — Low Balance Alert</div>
+              <div style={{fontSize:22,fontWeight:700,color:minBal<2000?P.red:P.gold,fontFamily:"'DM Serif Display',serif"}}>{fmtK(minBal)}</div>
+              <div style={{fontSize:10,color:P.muted,marginTop:2}}>{minDay?.date} — {minBal<2000?"⚠ critically low":"watch this date"}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Main chart */}
+      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:16,paddingLeft:8,marginBottom:10,flexWrap:"wrap"}}>
+          <span style={{fontSize:12,fontWeight:600,color:P.text}}>Combined Group Cash Position</span>
+          <span style={{fontSize:11,color:P.muted}}>Solid = actuals · Dashed = projected · ↓ = large payment day</span>
+          <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+            {["combined","clinics"].map(m=>(
+              <button key={m} onClick={()=>setViewMode(m)}
+                style={{background:viewMode===m?P.alt:"transparent",border:`1px solid ${viewMode===m?P.border:P.dim}`,color:viewMode===m?P.text:P.muted,borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:11}}>
+                {m==="combined"?"Combined":"Per Clinic"}
+              </button>
+            ))}
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={300}>
+          <AreaChart data={chartData} margin={{top:5,right:10,bottom:5,left:10}}>
+            <defs>
+              <linearGradient id="cashGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={P.teal} stopOpacity={0.25}/>
+                <stop offset="95%" stopColor={P.teal} stopOpacity={0.03}/>
+              </linearGradient>
+              {["Mt Evelyn","Olinda","Chirnside Park"].map(c=>(
+                <linearGradient key={c} id={`grad_${c.replace(/\s/g,"")}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={CC[c]} stopOpacity={0.2}/>
+                  <stop offset="95%" stopColor={CC[c]} stopOpacity={0}/>
+                </linearGradient>
+              ))}
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke={P.border} vertical={false}/>
+            <XAxis dataKey="label" tick={{fill:P.muted,fontSize:9}} interval={Math.max(1,Math.floor(chartData.length/12))} axisLine={false} tickLine={false}/>
+            <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={60} axisLine={false} tickLine={false}/>
+            <Tooltip content={({active,payload,label})=>{
+              if(!active||!payload?.length) return null;
+              const d = chartData.find(r=>r.label===label);
+              return <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:8,padding:"10px 14px",minWidth:200}}>
+                <div style={{color:P.muted,fontSize:11,marginBottom:6}}>{d?.date} {d?.isFuture?"(projected)":"(actual)"}</div>
+                {viewMode==="combined"?(
+                  <div style={{color:P.teal,fontWeight:700,fontSize:14,marginBottom:4}}>Group: {fmtK(d?.totalClose||0)}</div>
+                ):(
+                  ["Mt Evelyn","Olinda","Chirnside Park"].map(c=>{
+                    const v = d?.byClinic?.[c]?.closeBal || (c==="Chirnside Park"?chBalance:0);
+                    return <div key={c} style={{color:CC[c],fontSize:12,marginBottom:2}}>{c}: {fmtK(v)}</div>;
+                  })
+                )}
+                {d?.totalIn>0&&<div style={{color:P.green,fontSize:11,marginTop:4}}>↑ In: {fmtK(d.totalIn)}</div>}
+                {d?.totalOut>0&&(
+                  <div style={{color:P.red,fontSize:11}}>
+                    ↓ Out: {fmtK(d.totalOut)}
+                    {d.totalOut>15000&&<span style={{color:P.gold,marginLeft:4}}>(wages/BAS?)</span>}
+                  </div>
+                )}
+              </div>;
+            }}/>
+            {viewMode==="combined"?(
+              <Area type="monotone" dataKey="totalClose" name="Group Cash"
+                stroke={P.teal} fill="url(#cashGrad)" strokeWidth={2}
+                strokeDasharray="none"
+                dot={(props)=>{
+                  const d = chartData[props.index];
+                  if (d?.isFuture) return <circle key={props.key} cx={props.cx} cy={props.cy} r={1.5} fill={P.teal} opacity={0.4}/>;
+                  if (d?.bigOutflow) return <circle key={props.key} cx={props.cx} cy={props.cy} r={4} fill={P.red} opacity={0.8}/>;
+                  return <circle key={props.key} cx={props.cx} cy={props.cy} r={1.5} fill={P.teal} opacity={0.7}/>;
+                }}
+              />
+            ):(
+              ["Mt Evelyn","Olinda","Chirnside Park"].map(c=>{
+                const key = c==="Chirnside Park"&&!hasCh ? null : `byClinic.${c}.closeBal`;
+                const dataKey = c.replace(/\s+/g,"_")+"_close";
+                // We need flat data keys; add them
+                return (
+                  <Area key={c} type="monotone"
+                    dataKey={d => {
+                      if (c==="Chirnside Park"&&!hasCh) return chBalance;
+                      return d?.byClinic?.[c]?.closeBal||null;
+                    }}
+                    name={c} stroke={CC[c]} fill={`url(#grad_${c.replace(/\s/g,"")})`}
+                    strokeWidth={1.5} strokeDasharray="none" dot={false} connectNulls
+                  />
+                );
+              })
+            )}
+            {/* Today reference line */}
+            {todayRow&&<ReferenceLine x={chartData.find(d=>d.isToday||d.date===todayStr)?.label}
+              stroke={P.gold} strokeDasharray="4 4"
+              label={{value:"Today",fill:P.gold,fontSize:9,position:"insideTopRight"}}/>}
+            <ReferenceLine y={0} stroke={P.dim}/>
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Weekly summary table */}
+      {(()=>{
+        // Group combined data into weeks (Mon–Sun)
+        const weeks = [];
+        let wk = null;
+        for (const d of combined.slice(todayIdx-1, todayIdx+fwdDays+7)) {
+          if (!wk || new Date(d.date+"T00:00:00").getDay()===1) {
+            if (wk) weeks.push(wk);
+            wk = {start:d.date, end:d.date, totalIn:0, totalOut:0, endClose:0};
+          }
+          wk.end = d.date;
+          wk.totalIn  += d.totalIn;
+          wk.totalOut += d.totalOut;
+          wk.endClose  = d.totalClose;
+        }
+        if (wk) weeks.push(wk);
+        if (!weeks.length) return null;
+        return (
+          <>
+            <div style={{display:"flex",alignItems:"center",gap:10,margin:"26px 0 12px"}}>
+              <div style={{width:3,height:15,background:P.gold,borderRadius:2}}/>
+              <span style={{fontSize:11,fontWeight:700,color:P.muted,textTransform:"uppercase",letterSpacing:1.6}}>Weekly Summary — Group</span>
+            </div>
+            <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,overflow:"auto",marginBottom:16}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr style={{borderBottom:`1px solid ${P.border}`,background:P.alt}}>
+                    {["Week","Cash In","Cash Out","Net","Closing Balance"].map(h=>(
+                      <th key={h} style={{padding:"9px 14px",textAlign:h==="Week"?"left":"right",color:P.muted,fontSize:10,textTransform:"uppercase",letterSpacing:0.8}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {weeks.slice(0,10).map((w,i)=>{
+                    const net = w.totalIn - w.totalOut;
+                    const fmtD = s => new Date(s+"T00:00:00").toLocaleDateString("en-AU",{day:"numeric",month:"short"});
+                    const isPast = w.end < todayStr;
+                    return (
+                      <tr key={i} style={{borderBottom:`1px solid ${P.border}22`,background:isPast?`${P.dim}22`:i%2?`${P.alt}44`:"transparent"}}>
+                        <td style={{padding:"9px 14px",color:isPast?P.muted:P.text,fontSize:11}}>{fmtD(w.start)} – {fmtD(w.end)}{isPast?" ✓":""}</td>
+                        <td style={{padding:"9px 14px",textAlign:"right",color:P.green,fontVariantNumeric:"tabular-nums"}}>{fmtK(w.totalIn)}</td>
+                        <td style={{padding:"9px 14px",textAlign:"right",color:P.red,fontVariantNumeric:"tabular-nums"}}>{fmtK(w.totalOut)}</td>
+                        <td style={{padding:"9px 14px",textAlign:"right",color:net>=0?P.green:P.red,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{net>=0?"+":""}{fmtK(net)}</td>
+                        <td style={{padding:"9px 14px",textAlign:"right",color:P.text,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{fmtK(w.endClose)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        );
+      })()}
+
+      {/* Export length mismatch warning */}
+      {(()=>{
+        if (cfUploads.length < 2) return null;
+        const lengths = cfUploads.map(cf=>cf.days.length);
+        const maxLen  = Math.max(...lengths);
+        const shortClinics = cfUploads.filter(cf=>cf.days.length < maxLen * 0.6);
+        if (!shortClinics.length) return null;
+        return (
+          <div style={{background:`${P.blue}10`,border:`1px solid ${P.blue}44`,borderRadius:10,padding:"12px 16px",display:"flex",alignItems:"flex-start",gap:12,marginBottom:12}}>
+            <span style={{color:P.blue,fontSize:14,marginTop:1}}>ℹ</span>
+            <div style={{fontSize:12,color:P.muted,lineHeight:1.7}}>
+              <strong style={{color:P.text}}>Export range mismatch:</strong>{" "}
+              {shortClinics.map(cf=>`${cf.clinic} (${cf.days.length} days)`).join(", ")} {shortClinics.length===1?"has":"have"} a shorter projection window than the other clinics.{" "}
+              Re-export from Xero Cash Flow Manager with a <strong style={{color:P.text}}>6-month / 180-day range</strong> to align all three.
+              This matters for BAS quarters — a 90–180 day window captures the next 1–2 BAS payments which are your largest irregular cash events.
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Missing clinic notice */}
+      {!hasCh&&(
+        <div style={{background:`${P.gold}10`,border:`1px solid ${P.gold}44`,borderRadius:10,padding:"12px 16px",display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+          <span style={{color:P.gold,fontSize:14}}>⚠</span>
+          <div style={{flex:1,fontSize:12,color:P.muted}}>
+            Chirnside Park cash file not loaded — using manual balance of <strong style={{color:P.gold}}>{fmtK(chBalance)}</strong>.
+            This is a static offset (no daily projection for Chirnside). Export and drop the Chirnside Cash Flow Manager file to get the full combined view.
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:11,color:P.dim}}>Update balance:</span>
+            <input type="number" value={chBalance} onChange={e=>saveChBal(Number(e.target.value))}
+              style={{width:90,background:P.alt,border:`1px solid ${P.border}`,color:P.gold,borderRadius:6,padding:"5px 8px",fontSize:12,outline:"none"}}/>
+          </div>
+        </div>
+      )}
+      {/* BAS timing reminder */}
+      {(()=>{
+        const BAS_MONTHS = [1,4,7,10]; // Jan, Apr, Jul, Oct — due ~28th each
+        const today = new Date();
+        const upcoming = [];
+        for (let m=0; m<6; m++) {
+          const d = new Date(today.getFullYear(), today.getMonth()+m, 28);
+          if (BAS_MONTHS.includes(d.getMonth()+1) && d > today) {
+            upcoming.push(d.toLocaleDateString("en-AU",{day:"numeric",month:"long",year:"numeric"}));
+            if (upcoming.length>=2) break;
+          }
+        }
+        if (!upcoming.length) return null;
+        return (
+          <div style={{background:`${P.gold}08`,border:`1px solid ${P.gold}33`,borderRadius:10,padding:"12px 16px",marginBottom:12,display:"flex",gap:12,alignItems:"flex-start"}}>
+            <span style={{color:P.gold,fontSize:14,marginTop:1}}>📅</span>
+            <div style={{fontSize:12,color:P.muted,lineHeight:1.7}}>
+              <strong style={{color:P.gold}}>BAS/IAS reminder:</strong>{" "}
+              Next BAS due dates: <strong style={{color:P.text}}>{upcoming.join(" · ")}</strong>.{" "}
+              These are your largest irregular outflows — ensure a 90–180 day export window so Xero's projection captures them.
+              If BAS isn't showing in your cash projection, it hasn't been entered as a bill in Xero — do this manually for an accurate forecast.
+            </div>
+          </div>
+        );
+      })()}
+      <div style={{fontSize:11,color:P.dim,lineHeight:1.7}}>
+        ℹ Data sourced from Xero Cash Flow Manager exports — re-export weekly (90–180 day range) for best accuracy. Red dots on the chart = large outflow days (wages, BAS). Xero projects based on scheduled invoices, bills, and repeating transactions. If BAS isn't reflected in the projection, add it as a bill in Xero.
+      </div>
+    </div>
+  );
+}
+
+
+// ─── AI Assistant ─────────────────────────────────────────────────────────────
+function buildFinancialContext(uploads, cfUploads, ownerMode) {
+  if (!uploads.length) return null;
+
+  const clinics = ["Mt Evelyn","Olinda","Chirnside Park"];
+  const quarters = [...new Set(uploads.map(d=>d.quarter))].sort((a,b)=>qKey(a).localeCompare(qKey(b)));
+
+  // Build P&L summary table
+  let plLines = ["=== QUARTERLY P&L (all figures in AUD) ===\n"];
+  plLines.push(["Quarter","Clinic","Revenue","Gross Profit","OpEx","Net Profit","Adj EBITDA","EBITDA Margin%","Wages","Owner Salary","Owner Super","D&A","Interest"].join("\t"));
+  for (const q of quarters) {
+    for (const c of clinics) {
+      const d = uploads.find(u=>u.clinic===c&&u.quarter===q);
+      if (!d) continue;
+      const m = computeMetrics(d.accounts, c);
+      plLines.push([q,c,
+        Math.round(m.revenue), Math.round(m.grossProfit), Math.round(m.opex||0),
+        Math.round(m.netProfit), Math.round(m.adjEbitda),
+        m.ebitdaMargin.toFixed(1), Math.round(m.wages),
+        Math.round(m.ownerSalary), Math.round(m.ownerSuper),
+        Math.round(m.da), Math.round(m.interest)
+      ].join("\t"));
+    }
+  }
+
+  // Group totals
+  plLines.push("\n=== GROUP QUARTERLY TOTALS ===");
+  plLines.push(["Quarter","Total Revenue","Total Adj EBITDA","Group Margin%"].join("\t"));
+  for (const q of quarters) {
+    let rev=0, ebitda=0;
+    for (const c of clinics) {
+      const d = uploads.find(u=>u.clinic===c&&u.quarter===q);
+      if (!d) continue;
+      const m = computeMetrics(d.accounts, c);
+      rev+=m.revenue; ebitda+=m.adjEbitda;
+    }
+    plLines.push([q, Math.round(rev), Math.round(ebitda), rev?(ebitda/rev*100).toFixed(1):"—"].join("\t"));
+  }
+
+  // Trailing 4Q annualised per clinic
+  plLines.push("\n=== TRAILING 4 QUARTERS (ANNUALISED) ===");
+  const last4Q = quarters.slice(-4);
+  for (const c of clinics) {
+    const t4 = last4Q.reduce((s,q)=>{
+      const d=uploads.find(u=>u.clinic===c&&u.quarter===q);
+      if(!d) return s;
+      const m=computeMetrics(d.accounts,c);
+      return {rev:s.rev+m.revenue, ebitda:s.ebitda+m.adjEbitda, ownerCash:s.ownerCash+(m.ownerSalary+m.ownerSuper)};
+    },{rev:0,ebitda:0,ownerCash:0});
+    plLines.push(`${c}: Revenue $${Math.round(t4.rev).toLocaleString()} | Adj EBITDA $${Math.round(t4.ebitda).toLocaleString()} | Owner drawings $${Math.round(t4.ownerCash).toLocaleString()}`);
+  }
+
+  // Owner earnings note
+  const totalOwnerSalary = quarters.slice(-4).reduce((s,q)=>{
+    return s+clinics.reduce((cs,c)=>{
+      const d=uploads.find(u=>u.clinic===c&&u.quarter===q); if(!d) return cs;
+      const m=computeMetrics(d.accounts,c); return cs+m.ownerSalary+m.ownerSuper;
+    },0);
+  },0);
+  plLines.push(`\nAnnual owner salary + super (last 4Q): $${Math.round(totalOwnerSalary).toLocaleString()}`);
+  plLines.push("Note: Adj EBITDA adds back owner salary, super, D&A, and interest to net profit");
+  plLines.push("Note: 'Owner Earnings' = Net Profit + Owner Salary + Owner Super (cash available to owners after tax)");
+
+  // Cash flow section
+  let cashLines = ["\n=== CASH FLOW MANAGER (daily, from Xero) ==="];
+  if (cfUploads.length) {
+    const today = new Date().toISOString().slice(0,10);
+    for (const cf of cfUploads) {
+      const todayRow = cf.days.find(d=>d.date===today||d.isToday);
+      const lastRow = cf.days[cf.days.length-1];
+      cashLines.push(`\n${cf.clinic}:`);
+      cashLines.push(`  Today's balance: $${Math.round(todayRow?.closeBal||0).toLocaleString()}`);
+      cashLines.push(`  Projection end (${lastRow?.date}): $${Math.round(lastRow?.closeBal||0).toLocaleString()}`);
+      // Monthly closing balances
+      cashLines.push("  Monthly closing balances:");
+      const months = {};
+      for (const d of cf.days) {
+        const mo = d.date.slice(0,7);
+        months[mo] = d.closeBal;
+      }
+      for (const [mo,bal] of Object.entries(months)) {
+        cashLines.push(`    ${mo}: $${Math.round(bal).toLocaleString()}`);
+      }
+      // Big outflow days
+      const bigOut = cf.days.filter(d=>d.cashOut>8000).slice(0,10);
+      if (bigOut.length) {
+        cashLines.push("  Large outflow days (wages/BAS/other):");
+        for (const d of bigOut) cashLines.push(`    ${d.date}: $${Math.round(d.cashOut).toLocaleString()} out → balance $${Math.round(d.closeBal).toLocaleString()}`);
+      }
+    }
+    // Combined totals by month
+    cashLines.push("\n  === COMBINED GROUP CASH BY MONTH ===");
+    const allDates = [...new Set(cfUploads.flatMap(cf=>cf.days.map(d=>d.date)))].sort();
+    const groupByMonth = {};
+    for (const date of allDates) {
+      const mo = date.slice(0,7);
+      let total = 0;
+      for (const cf of cfUploads) {
+        const row = cf.days.find(d=>d.date===date);
+        if (row) total += row.closeBal;
+      }
+      groupByMonth[mo] = total;
+    }
+    for (const [mo,bal] of Object.entries(groupByMonth)) {
+      cashLines.push(`  ${mo}: $${Math.round(bal).toLocaleString()}`);
+    }
+  } else {
+    cashLines.push("No cash flow data loaded.");
+  }
+
+  // Business context
+  const context = `
+You are a financial analyst assistant for Form & Practice, an Australian physiotherapy and Pilates business with three clinic locations: Mt Evelyn, Olinda, and Chirnside Park (Victoria, Australia).
+
+Business structure:
+- Mt Evelyn and Chirnside Park operate under the same legal entity (Form & Practice Mt Evelyn Pty Ltd). Chirnside Park only became profitable in FY26.
+- Olinda operates as a separate entity (Form & Practice Olinda Pty Ltd)
+- Owner operators: Jerry Higgins and Kate Rae. Owner salaries are drawn from Mt Evelyn and Olinda only (not Chirnside).
+- General Manager: Ben Croxford
+- Accountant: Peter Gillis at ROCG Business Services
+- Medfin loans of ~$167k net (studio fit-outs) held under associated entity DRAH — not on F&P books, but relevant for net proceeds in any sale scenario
+- Australian financial year: July–September = Q1, October–December = Q2, January–March = Q3, April–June = Q4
+- BAS quarters due approximately 28 Oct, 28 Jan, 28 Apr, 28 Jul
+- Wages paid fortnightly
+
+Valuation context: Allied health practices typically sell at 3–5× trailing 12-month Adj. EBITDA for an asset sale. Any sale would require repaying Medfin (~$167k) from proceeds.
+
+When answering questions:
+- Be direct and specific — use actual dollar figures from the data
+- When asked about projections, clearly distinguish between Xero-derived cash flow projections (near-term, based on scheduled transactions) and trend-based estimates (longer-term)
+- When asked about EBITDA "adjusted for owner incomes", this means Adj EBITDA which already adds back owner salary and super
+- Flag any data limitations clearly (e.g. if cash flow data only goes to a certain date)
+- Keep answers concise — 2–4 short paragraphs maximum unless a table is genuinely helpful
+- Use Australian dollar formatting
+
+${plLines.join("\n")}
+${cashLines.join("\n")}
+`.trim();
+
+  return context;
+}
+
+function AIAssistant({uploads, cfUploads, ownerMode}) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput]       = useState("");
+  const [loading, setLoading]   = useState(false);
+  const [apiKey, setApiKey]     = useState(()=>localStorage.getItem("fp_ai_key")||"");
+  const [showKeyInput, setShowKeyInput] = useState(false);
+  const [error, setError]       = useState(null);
+  const bottomRef               = useRef();
+
+  const saveKey = k => { setApiKey(k); localStorage.setItem("fp_ai_key",k); };
+
+  const SUGGESTED = [
+    "What is our projected group cash balance in July 2026?",
+    "What is our predicted EBITDA adjusted for owner salaries across all three clinics?",
+    "Which clinic has the best EBITDA margin trend?",
+    "What would our indicative business valuation be at 3× and 4× EBITDA?",
+    "Where are the biggest cash flow risks in the next 90 days?",
+    "How much CAPEX could we service if we were acquiring a new site?",
+  ];
+
+  const send = async (text) => {
+    const q = (text||input).trim();
+    if (!q || loading) return;
+    if (!apiKey) { setShowKeyInput(true); return; }
+
+    const context = buildFinancialContext(uploads, cfUploads, ownerMode);
+    if (!context) { setError("Load your Xero files first, then ask questions."); return; }
+
+    setInput("");
+    setError(null);
+    const newMessages = [...messages, {role:"user",content:q}];
+    setMessages(newMessages);
+    setLoading(true);
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+        body: JSON.stringify({
+          model:"claude-opus-4-5",
+          max_tokens:1024,
+          system: context,
+          messages: newMessages.map(m=>({role:m.role,content:m.content})),
+        })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      const reply = data.content?.[0]?.text || "No response";
+      setMessages(prev=>[...prev,{role:"assistant",content:reply}]);
+    } catch(e) {
+      setError("API error: "+e.message);
+      setMessages(prev=>prev.slice(0,-1));
+    } finally {
+      setLoading(false);
+      setTimeout(()=>bottomRef.current?.scrollIntoView({behavior:"smooth"}),100);
+    }
+  };
+
+  const hasData = uploads.length > 0;
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 180px)",minHeight:500}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontSize:16,fontWeight:700,color:P.text}}>AI Financial Assistant</div>
+          <div style={{fontSize:12,color:P.muted,marginTop:2}}>
+            Ask questions about your loaded data in plain English
+            {!hasData&&<span style={{color:P.gold,marginLeft:6}}>— load your Xero files first</span>}
+          </div>
+        </div>
+        <button onClick={()=>setShowKeyInput(v=>!v)}
+          style={{background:apiKey?`${P.green}15`:P.alt,border:`1px solid ${apiKey?P.green:P.border}`,color:apiKey?P.green:P.muted,borderRadius:8,padding:"6px 14px",cursor:"pointer",fontSize:12,fontWeight:600}}>
+          {apiKey?"✓ API key set":"⚙ Set API key"}
+        </button>
+      </div>
+
+      {/* API key input */}
+      {showKeyInput&&(
+        <div style={{background:P.alt,border:`1px solid ${P.border}`,borderRadius:10,padding:"16px 18px",marginBottom:14}}>
+          <div style={{fontSize:12,color:P.muted,marginBottom:8,lineHeight:1.6}}>
+            Enter your <strong style={{color:P.text}}>Anthropic API key</strong> — stored locally in your browser, never sent anywhere except Anthropic's API.<br/>
+            Get one at <span style={{color:P.blue}}>console.anthropic.com</span> → API Keys → Create key. Usage billed at standard rates (~$0.01–0.03 per question).
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}
+              placeholder="sk-ant-..."
+              style={{flex:1,background:P.surface,border:`1px solid ${P.border}`,color:P.text,borderRadius:7,padding:"8px 12px",fontSize:13,outline:"none",fontFamily:"monospace"}}/>
+            <button onClick={()=>{saveKey(apiKey);setShowKeyInput(false);}}
+              style={{background:P.blue,border:"none",color:"white",borderRadius:7,padding:"8px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Suggested questions */}
+      {messages.length===0&&(
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:11,color:P.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:1,fontWeight:600}}>Suggested questions</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:7}}>
+            {SUGGESTED.map((s,i)=>(
+              <button key={i} onClick={()=>send(s)}
+                style={{background:P.surface,border:`1px solid ${P.border}`,color:P.text,borderRadius:20,padding:"7px 14px",cursor:"pointer",fontSize:12,textAlign:"left",transition:"all 0.15s"}}
+                onMouseOver={e=>e.currentTarget.style.borderColor=P.gold}
+                onMouseOut={e=>e.currentTarget.style.borderColor=P.border}>
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Message thread */}
+      <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",gap:12,paddingRight:4,marginBottom:12}}>
+        {messages.map((m,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
+            <div style={{
+              maxWidth:"80%",
+              background: m.role==="user"?P.blue:P.surface,
+              color: m.role==="user"?"white":P.text,
+              border: m.role==="assistant"?`1px solid ${P.border}`:"none",
+              borderRadius: m.role==="user"?"16px 16px 4px 16px":"16px 16px 16px 4px",
+              padding:"12px 16px",fontSize:13,lineHeight:1.65,
+              whiteSpace:"pre-wrap",
+            }}>
+              {m.role==="assistant"&&(
+                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6,paddingBottom:6,borderBottom:`1px solid ${P.border}`}}>
+                  <div style={{width:20,height:20,borderRadius:"50%",background:P.gold,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"white",fontWeight:700}}>AI</div>
+                  <span style={{fontSize:11,color:P.muted,fontWeight:600}}>F&P Financial Assistant</span>
+                </div>
+              )}
+              {m.content}
+            </div>
+          </div>
+        ))}
+        {loading&&(
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 16px",background:P.surface,border:`1px solid ${P.border}`,borderRadius:"16px 16px 16px 4px",width:"fit-content"}}>
+            <div style={{display:"flex",gap:4}}>
+              {[0,1,2].map(i=>(
+                <div key={i} style={{width:6,height:6,borderRadius:"50%",background:P.gold,
+                  animation:`pulse 1.2s ease-in-out ${i*0.2}s infinite`}}/>
+              ))}
+            </div>
+            <span style={{fontSize:12,color:P.muted}}>Analysing your data…</span>
+          </div>
+        )}
+        {error&&(
+          <div style={{background:`${P.red}10`,border:`1px solid ${P.red}44`,borderRadius:10,padding:"10px 14px",fontSize:12,color:P.red}}>
+            {error}
+          </div>
+        )}
+        <div ref={bottomRef}/>
+      </div>
+
+      {/* Input */}
+      <div style={{display:"flex",gap:8,background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"8px 8px 8px 14px",alignItems:"flex-end"}}>
+        <textarea value={input} onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
+          placeholder={hasData?"Ask anything about your financials — cash, EBITDA, trends, valuations…":"Load your Xero P&L files first, then ask questions"}
+          rows={2} disabled={!hasData||loading}
+          style={{flex:1,background:"transparent",border:"none",color:P.text,fontSize:13,resize:"none",outline:"none",lineHeight:1.5,padding:"4px 0",fontFamily:"inherit"}}/>
+        <button onClick={()=>send()} disabled={!input.trim()||loading||!hasData}
+          style={{background:input.trim()&&!loading&&hasData?P.gold:"#E2E2DC",border:"none",color:input.trim()&&!loading&&hasData?"white":P.muted,borderRadius:8,padding:"9px 16px",cursor:input.trim()&&!loading&&hasData?"pointer":"not-allowed",fontSize:13,fontWeight:700,transition:"all 0.15s",flexShrink:0}}>
+          {loading?"…":"Ask →"}
+        </button>
+      </div>
+      {messages.length>0&&(
+        <button onClick={()=>setMessages([])} style={{background:"none",border:"none",color:P.muted,fontSize:11,cursor:"pointer",marginTop:8,textAlign:"center"}}>
+          Clear conversation
+        </button>
+      )}
+      <style>{`@keyframes pulse{0%,100%{opacity:0.3;transform:scale(0.8)}50%{opacity:1;transform:scale(1)}}`}</style>
+    </div>
+  );
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+function FPDashboard() {
+  const [uploads,     setUploads]     = useState([]);
+  const [clinic,      setClinic]      = useState("__all");
+  const [view,        setView]        = useState("overview");
+  const [gmMode,      setGmMode]      = useState(false);
+  const [notice,      setNotice]      = useState("");
+  const [ownerMode,   setOwnerMode]   = useState(false);
+  const [cfUploads,   setCfUploads]   = useState([]); // cash flow statement uploads
+  const [debtService, setDebtService] = useState(()=>Number(localStorage.getItem("fp_ds")||40000));
+  const saveDS = v => { setDebtService(v); localStorage.setItem("fp_ds", v); };
+  // URL hash clinic manager mode: #manager-chirnside etc.
+  const urlHash    = typeof window!=="undefined"?window.location.hash:"";
+  const managerClinic = (() => {
+    const m = urlHash.match(/#manager-(.+)/i);
+    if (!m) return null;
+    return CLINICS.find(c=>c.toLowerCase().replace(/\s+/g,"-")===m[1].toLowerCase())||null;
+  })();
+  const isManagerMode = !!managerClinic;
+
+  const handleFiles = useCallback((files) => {
+    // Try to detect if file is a cash flow statement (has "cash flow" in filename or content)
+    // parseXeroCashFlow returns null if not a CF file
+    // We attempt both parsers and route accordingly
+    const handleRaw = async (fileList) => {
+      const cfResults=[], plResults=[];
+      for (const file of Array.from(fileList)) {
+        if (!file.name.match(/\.xlsx?$/i)) continue;
+        const buf = await file.arrayBuffer();
+        const isCF = file.name.toLowerCase().match(/cash.?flow|cashflow|statement.of.cash/);
+        if (isCF) {
+          const cf = parseXeroCashFlow(buf);
+          if (cf) cfResults.push(cf);
+        } else {
+          const pl = parseXeroMultiCol(buf);
+          plResults.push(...pl.filter(Boolean));
+        }
+      }
+      if (cfResults.length) {
+        setCfUploads(prev=>{
+          const next=[...prev];
+          for (const cf of cfResults) {
+            const idx=next.findIndex(d=>d.clinic===cf.clinic);
+            idx>=0?next[idx]=cf:next.push(cf);
+          }
+          return next;
+        });
+      }
+      if (plResults.length) {
+        setUploads(prev => {
+          const next=[...prev];
+          for (const p of plResults) {
+            const idx=next.findIndex(d=>d.clinic===p.clinic&&d.quarter===p.quarter);
+            idx>=0?next[idx]=p:next.push(p);
+          }
+          return next;
+        });
+      }
+    };
+    handleRaw(files);
+  }, []);
+  // end handlePLFiles
+
+
+  const handleCashFiles = useCallback((cfResults) => {
+    setCfUploads(prev=>{
+      const next=[...prev];
+      for (const cf of cfResults) {
+        const idx=next.findIndex(d=>d.clinic===cf.clinic);
+        idx>=0?next[idx]=cf:next.push(cf);
+      }
+      setNotice(`✓ Cash flow loaded for: ${cfResults.map(c=>c.clinic).join(", ")}`);
+      return next;
+    });
+  }, []);
+
+  const handlePLFiles = useCallback((parsed) => {
+    setUploads(prev => {
+      const next = [...prev];
+      let added=0, skipped=[];
+      for (const p of parsed) {
+        if (!p.clinic||!p.quarter) { skipped.push(p.filename||"unknown"); continue; }
+        const idx = next.findIndex(d=>d.clinic===p.clinic&&d.quarter===p.quarter);
+        idx>=0 ? next[idx]=p : next.push(p);
+        added++;
+      }
+      setNotice(`✓ ${added} quarters loaded · ${next.length} total`+(skipped.length?` · ⚠ Skipped: ${skipped.join(", ")}`:""));
+      return next;
+    });
+  }, []);
+
+  const quarters      = useMemo(()=>[...new Set(uploads.map(d=>d.quarter))].sort((a,b)=>qKey(a).localeCompare(qKey(b))),[uploads]);
+  const loadedClinics = useMemo(()=>CLINICS.filter(c=>uploads.some(d=>d.clinic===c)),[uploads]);
+
+  const effectiveClinic = isManagerMode ? (managerClinic||clinic) : clinic;
+
+  const clinicData    = useMemo(()=>
+    (effectiveClinic==="__all"?[]:uploads.filter(d=>d.clinic===effectiveClinic)).sort((a,b)=>qKey(a.quarter).localeCompare(qKey(b.quarter))),
+  [uploads,clinic,effectiveClinic]);
+
+  const clinicMetrics = useMemo(()=>
+    clinicData.map(d=>({...computeMetrics(d.accounts,d.clinic),quarter:d.quarter,clinic:d.clinic})),
+  [clinicData]);
+
+  const latest = clinicMetrics[clinicMetrics.length-1]||null;
+  const prevM  = clinicMetrics[clinicMetrics.length-2]||null;
+  const dQoQ   = key=>(latest&&prevM&&prevM[key])?((latest[key]-prevM[key])/Math.abs(prevM[key]))*100:undefined;
+
+  const trailing4Q = useMemo(()=>{
+    if (clinic==="__all") return quarters.slice(-4).reduce((s,q)=>s+CLINICS.reduce((cs,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);return cs+(d?computeMetrics(d.accounts,c).adjEbitda:0)},0),0);
+    return clinicMetrics.slice(-4).reduce((s,m)=>s+m.adjEbitda,0);
+  },[clinic,quarters,uploads,clinicMetrics]);
+
+  const groupTrend = useMemo(()=>quarters.map(q=>{
+    const row={quarter:q}; let gR=0,gE=0,gW=0;
+    for (const c of CLINICS) {
+      const d=uploads.find(u=>u.clinic===c&&u.quarter===q); if(!d) continue;
+      const m=computeMetrics(d.accounts,c);
+      row[c+"_rev"]=m.revenue; row[c+"_ebitda"]=m.adjEbitda;
+      gR+=m.revenue; gE+=m.adjEbitda; gW+=m.wages;
+    }
+    row.gRev=gR; row.gEbitda=gE;
+    row.gMargin=gR?(gE/gR)*100:0;
+    return row;
+  }),[quarters,uploads]);
+
+  const seasonality = useMemo(()=>{
+    if(clinic==="__all") return [];
+    const byQ={Q1:[],Q2:[],Q3:[],Q4:[]};
+    for(const m of clinicMetrics){const qn=m.quarter?.match(/Q(\d)/)?.[1];if(qn)byQ[`Q${qn}`].push(m);}
+    return ["Q1","Q2","Q3","Q4"].map(q=>({
+      quarter:q, label:{Q1:"Jul–Sep",Q2:"Oct–Dec",Q3:"Jan–Mar",Q4:"Apr–Jun"}[q],
+      avgRev:   byQ[q].length?byQ[q].reduce((s,x)=>s+x.revenue,0)/byQ[q].length:0,
+      avgEbitda:byQ[q].length?byQ[q].reduce((s,x)=>s+x.adjEbitda,0)/byQ[q].length:0,
+      avgMargin:byQ[q].length?byQ[q].reduce((s,x)=>s+x.ebitdaMargin,0)/byQ[q].length:0,
+      n:byQ[q].length,
+    })).filter(x=>x.n>0);
+  },[clinic,clinicMetrics]);
+
+  const flags = useMemo(()=>{
+    if(!latest) return [];
+    return makeFlags(latest, clinic, latest.quarter, uploads);
+  },[latest,clinic,uploads]);
+
+  const hasData = uploads.length>0;
+  const TAB=(id,label)=>(
+    <button onClick={()=>setView(id)} style={{background:view===id?P.alt:"transparent",border:`1px solid ${view===id?P.border:"transparent"}`,color:view===id?P.text:P.muted,borderRadius:7,padding:"7px 14px",cursor:"pointer",fontSize:12,transition:"all 0.15s",whiteSpace:"nowrap"}}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{minHeight:"100vh",background:P.bg,color:P.text,fontFamily:"'DM Sans','Segoe UI',sans-serif"}}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap');*{box-sizing:border-box}::-webkit-scrollbar{width:5px;background:${P.bg}}::-webkit-scrollbar-thumb{background:${P.dim};border-radius:3px}body{background:${P.bg}}`}</style>
+
+      {/* Header */}
+      <div style={{background:P.surface,borderBottom:`2px solid ${P.border}`,padding:"13px 28px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:12}}>
+          <span style={{fontFamily:"'DM Serif Display',serif",fontSize:20}}>Form &amp; Practice</span>
+          <span style={{fontSize:10,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.5}}>Financial Analyser</span>
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          {hasData&&<span style={{fontSize:11,color:P.muted,background:P.alt,padding:"5px 10px",borderRadius:6}}>{uploads.length} periods · {loadedClinics.length} clinics · {quarters.length} quarters</span>}
+          {hasData&&!isManagerMode&&<button onClick={()=>setGmMode(g=>!g)} style={{background:gmMode?`${P.green}22`:"transparent",border:`1px solid ${gmMode?P.green:P.border}`,color:gmMode?P.green:P.muted,borderRadius:7,padding:"6px 14px",cursor:"pointer",fontSize:12}}>
+            {gmMode?"← Analysis":"GM Report →"}
+          </button>}
+          {!isManagerMode&&<PinGate ownerMode={ownerMode} onToggle={setOwnerMode}/>}
+        </div>
+      </div>
+
+      <div style={{maxWidth:1200,margin:"0 auto",padding:"22px 20px"}}>
+
+        {!gmMode&&(
+          <div style={{marginBottom:20}}>
+            <DropZone onPL={handlePLFiles} onCash={handleCashFiles}/>
+            {notice&&<div style={{fontSize:12,color:notice.startsWith("✓")?P.green:P.muted,marginTop:8,paddingLeft:2}}>{notice}</div>}
+            {hasData&&(
+              <div style={{marginTop:10,display:"flex",flexWrap:"wrap",gap:5}}>
+                {loadedClinics.map(c=>{
+                  const qs=uploads.filter(d=>d.clinic===c).sort((a,b)=>qKey(a.quarter).localeCompare(qKey(b.quarter)));
+                  const first=qs[0]?.quarter, last=qs[qs.length-1]?.quarter;
+                  return <div key={c} style={{display:"flex",alignItems:"center",gap:6,background:P.alt,borderRadius:6,padding:"5px 12px",fontSize:12,color:P.muted,border:`1px solid ${CC[c]}44`}}>
+                    <span style={{width:8,height:8,borderRadius:"50%",background:CC[c],flexShrink:0}}/>
+                    <span style={{color:CC[c],fontWeight:600}}>{c}</span>
+                    <span>{first} → {last} ({qs.length}Q)</span>
+                    <button onClick={()=>setUploads(p=>p.filter(d=>d.clinic!==c))} style={{background:"none",border:"none",color:P.dim,cursor:"pointer",fontSize:13,lineHeight:1,padding:0,marginLeft:2}}>×</button>
+                  </div>;
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {gmMode&&hasData&&<GMReport uploads={uploads}/>}
+
+        {!gmMode&&hasData&&(
+          <>
+            {/* Clinic tabs */}
+            <div style={{display:"flex",gap:4,marginBottom:18,flexWrap:"wrap",alignItems:"center"}}>
+              <button onClick={()=>setClinic("__all")} style={{background:clinic==="__all"?`${P.gold}22`:"transparent",border:`1px solid ${clinic==="__all"?P.gold:P.border}`,color:clinic==="__all"?P.gold:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>Group</button>
+              {loadedClinics.map(c=>(
+                <button key={c} onClick={()=>setClinic(c)} style={{background:clinic===c?`${CC[c]}22`:"transparent",border:`1px solid ${clinic===c?CC[c]:P.border}`,color:clinic===c?CC[c]:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+                  {c} <span style={{opacity:.6,fontSize:11}}>({uploads.filter(d=>d.clinic===c).length}Q)</span>
+                </button>
+              ))}
+              <div style={{width:1,height:24,background:P.border,margin:"0 4px"}}/>
+              <button onClick={()=>setClinic("__annual")} style={{background:clinic==="__annual"?`${P.gold}22`:"transparent",border:`1px solid ${clinic==="__annual"?P.gold:P.border}`,color:clinic==="__annual"?P.gold:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+                ★ Annual Overview
+              </button>
+              <button onClick={()=>setClinic("__cashflow")} style={{background:clinic==="__cashflow"?`${P.green}22`:"transparent",border:`1px solid ${clinic==="__cashflow"?P.green:P.border}`,color:clinic==="__cashflow"?P.green:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+                ⬡ Cash Flow
+              </button>
+              <button onClick={()=>setClinic("__explorer")} style={{background:clinic==="__explorer"?`${P.teal}22`:"transparent",border:`1px solid ${clinic==="__explorer"?P.teal:P.border}`,color:clinic==="__explorer"?P.teal:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+                ⬡ Explorer
+              </button>
+              <button onClick={()=>setClinic("__ai")} style={{background:clinic==="__ai"?`${P.gold}22`:"transparent",border:`1px solid ${clinic==="__ai"?P.gold:P.border}`,color:clinic==="__ai"?P.gold:P.muted,borderRadius:8,padding:"7px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>
+                ✦ Ask AI
+              </button>
+            </div>
+
+            {/* ─── GROUP VIEW ─── */}
+            {clinic==="__all"&&clinic!=="__annual"&&clinic!=="__explorer"&&clinic!=="__cashflow"&&clinic!=="__ai"&&(()=>{
+              const lq=quarters[quarters.length-1], pq=quarters[quarters.length-2];
+              if(!lq) return null;
+              const gm=CLINICS.reduce((a,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===lq);if(!d)return a;const m=computeMetrics(d.accounts,c);return{rev:a.rev+m.revenue,ebitda:a.ebitda+m.adjEbitda};},{rev:0,ebitda:0});
+              const pg=pq?CLINICS.reduce((a,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===pq);if(!d)return a;const m=computeMetrics(d.accounts,c);return{rev:a.rev+m.revenue,ebitda:a.ebitda+m.adjEbitda};},{rev:0,ebitda:0}):null;
+              return (
+                <>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:20}}>
+                    <Card label="Group Revenue" value={fmtK(gm.rev)} sub={lq} delta={pg?.rev?((gm.rev-pg.rev)/pg.rev*100):undefined}/>
+                    <Card label="Group Adj. EBITDA" value={fmtK(gm.ebitda)} color={P.gold} delta={pg?.ebitda?((gm.ebitda-pg.ebitda)/Math.abs(pg.ebitda)*100):undefined}/>
+                    <Card label="EBITDA Margin" value={gm.rev?pct(gm.ebitda,gm.rev):"—"} color={P.gold}/>
+                    <Card label="Trailing 4Q EBITDA" value={fmtK(trailing4Q)} sub="sum, not annualised"/>
+                    <Card label="Indicative Value" value={`${fmtK(trailing4Q*3)}–${fmtK(trailing4Q*5)}`} sub="3–5× trailing 4Q" color={P.green}/>
+                  </div>
+
+                  {groupTrend.length>1&&<>
+                    <SH>Group Revenue by Clinic</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                      <ResponsiveContainer width="100%" height={220}>
+                        <BarChart data={groupTrend} barCategoryGap="22%">
+                          <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                          <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                          <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                          <Tooltip content={<TT/>}/>
+                          <Legend/>
+                          {loadedClinics.map(c=><Bar key={c} dataKey={`${c}_rev`} name={c} fill={CC[c]} stackId="a" opacity={0.85}/>)}
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    <SH>Group Adj. EBITDA by Clinic</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                      <ResponsiveContainer width="100%" height={200}>
+                        <LineChart data={groupTrend}>
+                          <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                          <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                          <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                          <Tooltip content={<TT/>}/>
+                          <Legend/>
+                          {loadedClinics.map(c=><Line key={c} type="monotone" dataKey={`${c}_ebitda`} name={c} stroke={CC[c]} strokeWidth={2} dot={{r:2,fill:CC[c]}}/>)}
+                          <Line type="monotone" dataKey="gEbitda" name="Group Total" stroke={P.gold} strokeWidth={2.5} strokeDasharray="5 3" dot={{r:3,fill:P.gold}}/>
+                          <ReferenceLine y={0} stroke={P.dim} strokeDasharray="3 3"/>
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    <SH>Group EBITDA Margin %</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                      <ResponsiveContainer width="100%" height={160}>
+                        <AreaChart data={groupTrend}>
+                          <defs><linearGradient id="mg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={P.gold} stopOpacity={0.3}/><stop offset="95%" stopColor={P.gold} stopOpacity={0}/></linearGradient></defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                          <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                          <YAxis tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40}/>
+                          <Tooltip formatter={v=>`${Number(v).toFixed(1)}%`}/>
+                          <Area type="monotone" dataKey="gMargin" name="EBITDA Margin %" stroke={P.gold} fill="url(#mg)" strokeWidth={2}/>
+                          <ReferenceLine y={15} stroke={P.green} strokeDasharray="4 4" label={{value:"15%",fill:P.green,fontSize:9,position:"insideTopRight"}}/>
+                          <ReferenceLine y={10} stroke={P.red} strokeDasharray="4 4" label={{value:"10%",fill:P.red,fontSize:9,position:"insideTopRight"}}/>
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    <SH>Consolidated Quarterly Summary</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,overflow:"auto",marginBottom:16}}>
+                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:700}}>
+                        <thead>
+                          <tr style={{borderBottom:`1px solid ${P.border}`,background:P.alt}}>
+                            <th style={{padding:"8px 12px",textAlign:"left",color:P.muted,fontSize:10,textTransform:"uppercase",position:"sticky",left:0,background:P.alt,minWidth:150}}>Metric</th>
+                            {quarters.map(q=><th key={q} style={{padding:"8px 10px",textAlign:"right",color:P.muted,fontSize:10,whiteSpace:"nowrap"}}>{q}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {CLINICS.filter(c=>loadedClinics.includes(c)).flatMap(c=>[
+                            <tr key={c+"r"} style={{borderBottom:`1px solid ${P.border}10`}}>
+                              <td style={{padding:"6px 12px",color:CC[c],fontWeight:600,position:"sticky",left:0,background:P.surface}}>{c} Rev</td>
+                              {quarters.map(q=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);const m=d?computeMetrics(d.accounts,c):null;return<td key={q} style={{padding:"6px 10px",textAlign:"right",color:P.muted,fontVariantNumeric:"tabular-nums"}}>{m?fmtK(m.revenue):"—"}</td>;})}
+                            </tr>,
+                            <tr key={c+"e"} style={{borderBottom:`1px solid ${P.border}20`,background:`${CC[c]}06`}}>
+                              <td style={{padding:"4px 12px 8px 20px",color:P.muted,fontSize:11,position:"sticky",left:0,background:`${P.surface}`}}>↳ Adj. EBITDA</td>
+                              {quarters.map(q=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);const m=d?computeMetrics(d.accounts,c):null;return<td key={q} style={{padding:"4px 10px 8px",textAlign:"right",color:m?(m.adjEbitda>=0?P.gold:P.red):P.dim,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{m?fmtK(m.adjEbitda):"—"}</td>;})}
+                            </tr>,
+                          ])}
+                          <tr style={{borderTop:`1px solid ${P.border}`,background:`${P.gold}08`}}>
+                            <td style={{padding:"8px 12px",color:P.gold,fontWeight:700,position:"sticky",left:0,background:`${P.surface}`}}>Group Rev</td>
+                            {quarters.map(q=>{const t=CLINICS.reduce((s,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);return s+(d?computeMetrics(d.accounts,c).revenue:0)},0);return<td key={q} style={{padding:"8px 10px",textAlign:"right",color:P.goldL,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{t?fmtK(t):"—"}</td>;})}
+                          </tr>
+                          <tr style={{background:`${P.gold}08`}}>
+                            <td style={{padding:"4px 12px 10px",color:P.gold,fontWeight:700,position:"sticky",left:0,background:`${P.surface}`}}>Group Adj. EBITDA</td>
+                            {quarters.map(q=>{const t=CLINICS.reduce((s,c)=>{const d=uploads.find(u=>u.clinic===c&&u.quarter===q);return s+(d?computeMetrics(d.accounts,c).adjEbitda:0)},0);return<td key={q} style={{padding:"4px 10px 10px",textAlign:"right",color:t>=0?P.gold:P.red,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{t?fmtK(t):"—"}</td>;})}
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </>}
+                </>
+              );
+            })()}
+
+            {/* ─── SINGLE CLINIC ─── */}
+            {clinic!=="__all"&&clinic!=="__explorer"&&clinic!=="__cashflow"&&clinic!=="__annual"&&clinic!=="__ai"&&latest&&(
+              <>
+                <div style={{display:"flex",gap:2,marginBottom:16,background:P.surface,padding:3,borderRadius:9,border:`1px solid ${P.border}`,width:"fit-content",flexWrap:"wrap"}}>
+                  {TAB("overview","Overview")}
+                  {TAB("revenue","Revenue Mix")}
+                  {TAB("expenses","Expenses")}
+                  {TAB("seasonality","Seasonality")}
+                  {TAB("flags",`Flags${flags.length?" ("+flags.length+")":""}`)}
+                  {TAB("targets","Targets")}
+                  {TAB("breakeven","Break-Even")}
+                  {!isManagerMode&&TAB("valuation","Valuation")}
+                </div>
+
+                {/* OVERVIEW */}
+                {view==="overview"&&(
+                  <>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:18}}>
+                      <Card label="Revenue" value={fmtK(latest.revenue)} sub={pct(latest.grossProfit,latest.revenue)+" GP"} delta={dQoQ("revenue")}/>
+                      <Card label="Gross Profit" value={fmtK(latest.grossProfit)} color={P.green}/>
+                      <Card label="Adj. EBITDA" value={fmtK(latest.adjEbitda)} color={P.gold} delta={dQoQ("adjEbitda")}/>
+                      <Card label="EBITDA Margin" value={latest.ebitdaMargin.toFixed(1)+"%"} color={latest.ebitdaMargin>15?P.green:latest.ebitdaMargin>8?P.gold:P.red}/>
+                      {ownerMode&&<Card label="Owner Earnings" value={fmtK(latest.ownerEarnings)} color={P.teal} sub="net profit + owner comp" delta={dQoQ("ownerEarnings")}/>}
+                    </div>
+                    {/* Revenue Efficiency + DSC row */}
+                    {(()=>{
+                      const dsc = debtService>0 ? (latest.adjEbitda*4)/debtService : null;
+                      const eff = latest.revenuePerWage;
+                      return (
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12,marginBottom:18}}>
+                          {eff!=null&&<div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 18px"}}>
+                            <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Revenue Efficiency</div>
+                            <div style={{fontSize:22,fontWeight:700,color:eff>=3?P.green:eff>=2?P.gold:P.red,fontFamily:"'DM Serif Display',serif"}}>{eff.toFixed(2)}×</div>
+                            <div style={{fontSize:11,color:P.muted,marginTop:2}}>revenue per $1 of wages</div>
+                            <div style={{fontSize:10,color:P.dim,marginTop:3}}>≥3× excellent · 2–3× solid · &lt;2× watch</div>
+                          </div>}
+                          {latest.wageRatio>0&&<div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 18px"}}>
+                            <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Wages % Revenue</div>
+                            <div style={{fontSize:22,fontWeight:700,color:latest.wageRatio<=55?P.green:latest.wageRatio<=65?P.gold:P.red,fontFamily:"'DM Serif Display',serif"}}>{latest.wageRatio.toFixed(1)}%</div>
+                            <div style={{fontSize:11,color:P.muted,marginTop:2}}>Allied health benchmark ≤60%</div>
+                          </div>}
+                          {ownerMode&&dsc!=null&&<div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 18px"}}>
+                            <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.2,fontFamily:"monospace",marginBottom:4}}>Debt Service Coverage</div>
+                            <div style={{fontSize:22,fontWeight:700,color:dsc>=2?P.green:dsc>=1.25?P.gold:P.red,fontFamily:"'DM Serif Display',serif"}}>{dsc.toFixed(2)}×</div>
+                            <div style={{fontSize:11,color:P.muted,marginTop:2}}>ann. EBITDA ÷ ${(debtService/1000).toFixed(0)}k/yr debt service</div>
+                            <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6}}>
+                              <span style={{fontSize:10,color:P.dim}}>Annual repayments:</span>
+                              <input type="number" value={debtService} onChange={e=>saveDS(Number(e.target.value))}
+                                style={{width:80,background:P.alt,border:`1px solid ${P.border}`,color:P.muted,borderRadius:4,padding:"2px 6px",fontSize:11,outline:"none"}}/>
+                            </div>
+                          </div>}
+                        </div>
+                      );
+                    })()}
+
+                    {(latest.ownerSalary+latest.ownerSuper+latest.da+latest.interest)>0&&(
+                      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"16px 20px",marginBottom:16}}>
+                        <div style={{fontSize:9,color:P.muted,textTransform:"uppercase",letterSpacing:1.3,fontFamily:"monospace",marginBottom:12}}>EBITDA Bridge</div>
+                        <div style={{display:"flex",flexWrap:"wrap",gap:16,alignItems:"flex-end"}}>
+                          {[
+                            {l:"Net Profit",v:latest.netProfit,c:P.text},
+                            {l:"+ D&A",v:latest.da,c:P.blue},
+                            {l:"+ Interest",v:latest.interest,c:P.purple},
+                            {l:"= EBITDA",v:latest.ebitda,c:P.text,sep:true},
+                            {l:"+ Owner Salary",v:latest.ownerSalary,c:P.gold},
+                            {l:"+ Owner Super",v:latest.ownerSuper,c:P.gold},
+                            {l:"= Adj. EBITDA",v:latest.adjEbitda,c:P.green,bold:true},
+                          ].map(({l,v,c,bold,sep},i)=>(
+                            <div key={i} style={{display:"flex",flexDirection:"column",gap:2,borderLeft:sep?`1px solid ${P.border}`:"none",paddingLeft:sep?16:0}}>
+                              <span style={{fontSize:9,color:P.muted,fontFamily:"monospace"}}>{l}</span>
+                              <span style={{fontSize:bold?20:16,fontWeight:bold?700:500,color:c,fontFamily:"'DM Serif Display',serif"}}>{fmtK(v)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {clinicMetrics.length>1&&<>
+                      <SH>Quarterly Trend — {clinic}</SH>
+                      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                        {(()=>{
+                          // Compute rolling 12-month (4Q sum) for revenue and ebitda
+                          const withRolling = clinicMetrics.map((m,i)=>{
+                            const slice = clinicMetrics.slice(Math.max(0,i-3),i+1);
+                            const r12rev   = slice.length===4 ? slice.reduce((s,x)=>s+x.revenue,0) : null;
+                            const r12ebitda= slice.length===4 ? slice.reduce((s,x)=>s+x.adjEbitda,0) : null;
+                            return {...m, r12rev, r12ebitda};
+                          });
+                          return (
+                            <ResponsiveContainer width="100%" height={220}>
+                              <LineChart data={withRolling}>
+                                <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                                <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                                <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                                <Tooltip content={<TT/>}/>
+                                <Legend/>
+                                <Line type="monotone" dataKey="revenue" name="Revenue" stroke={CC[clinic]||P.blue} strokeWidth={2} dot={{r:2}}/>
+                                <Line type="monotone" dataKey="adjEbitda" name="Adj. EBITDA" stroke={P.gold} strokeWidth={2.5} dot={{r:3,fill:P.gold}}/>
+                                <Line type="monotone" dataKey="r12rev" name="Rolling 12M Rev" stroke={CC[clinic]||P.blue} strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls/>
+                                <Line type="monotone" dataKey="r12ebitda" name="Rolling 12M EBITDA" stroke={P.gold} strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls/>
+                                <ReferenceLine y={0} stroke={P.dim} strokeDasharray="4 4"/>
+                              </LineChart>
+                            </ResponsiveContainer>
+                          );
+                        })()}
+                      </div>
+
+                      <SH>EBITDA Margin % Trend</SH>
+                      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                        <ResponsiveContainer width="100%" height={150}>
+                          <AreaChart data={clinicMetrics}>
+                            <defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={P.gold} stopOpacity={0.3}/><stop offset="95%" stopColor={P.gold} stopOpacity={0}/></linearGradient></defs>
+                            <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                            <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                            <YAxis tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40}/>
+                            <Tooltip formatter={v=>`${Number(v).toFixed(1)}%`}/>
+                            <Area type="monotone" dataKey="ebitdaMargin" name="EBITDA Margin %" stroke={P.gold} fill="url(#cg)" strokeWidth={2}/>
+                            <ReferenceLine y={15} stroke={P.green} strokeDasharray="4 4" label={{value:"15%",fill:P.green,fontSize:9}}/>
+                            <ReferenceLine y={10} stroke={P.red} strokeDasharray="4 4" label={{value:"10%",fill:P.red,fontSize:9}}/>
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </>}
+                  </>
+                )}
+
+                {/* REVENUE MIX */}
+                {view==="revenue"&&(()=>{
+                  const services=[...new Set(clinicMetrics.flatMap(m=>m.incomeDetail.map(x=>x.name)))].filter(s=>{
+                    const tot=clinicMetrics.reduce((sum,m)=>sum+(m.incomeDetail.find(i=>i.name===s)?.val||0),0);
+                    return tot>0;
+                  });
+                  const data=clinicMetrics.map(m=>({quarter:m.quarter,...Object.fromEntries(services.map(s=>[s,m.incomeDetail.find(x=>x.name===s)?.val||0]))}));
+                  const SVC_LINE_COLORS=[P.blue,P.gold,P.green,P.purple,P.orange,P.teal,"#f43f5e","#8b5cf6"];
+                  return (
+                    <>
+                      {/* Service line trend */}
+                      {clinicMetrics.length>1&&<>
+                        <SH>Service Line Trend — {clinic}</SH>
+                        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                          <ResponsiveContainer width="100%" height={220}>
+                            <LineChart data={data}>
+                              <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                              <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                              <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                              <Tooltip content={<TT/>}/>
+                              <Legend/>
+                              {services.map((s,i)=>(
+                                <Line key={s} type="monotone" dataKey={s} name={s} stroke={SVC_LINE_COLORS[i%SVC_LINE_COLORS.length]} strokeWidth={2} dot={{r:2}} connectNulls/>
+                              ))}
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                        <SH>Wages % Revenue — {clinic}</SH>
+                        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                          <ResponsiveContainer width="100%" height={150}>
+                            <AreaChart data={clinicMetrics}>
+                              <defs><linearGradient id="wg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={P.orange} stopOpacity={0.3}/><stop offset="95%" stopColor={P.orange} stopOpacity={0}/></linearGradient></defs>
+                              <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                              <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                              <YAxis tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40} domain={[0,'auto']}/>
+                              <Tooltip formatter={v=>`${Number(v).toFixed(1)}%`}/>
+                              <Area type="monotone" dataKey="wageRatio" name="Wages % Revenue" stroke={P.orange} fill="url(#wg)" strokeWidth={2}/>
+                              <ReferenceLine y={60} stroke={P.gold} strokeDasharray="4 4" label={{value:"60%",fill:P.gold,fontSize:9,position:"insideTopRight"}}/>
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </>}
+                      <SH>Revenue by Service — {latest.quarter}</SH>
+                      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"20px 24px",marginBottom:16}}>
+                        {latest.incomeDetail.filter(i=>i.val>0).sort((a,b)=>b.val-a.val).map((item,i)=>{
+                          const w=latest.revenue?(item.val/latest.revenue)*100:0;
+                          return (
+                            <div key={i} style={{marginBottom:12}}>
+                              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                                <span style={{fontSize:13,color:P.text}}>{item.name}</span>
+                                <span style={{fontSize:13}}><span style={{color:P.text,fontVariantNumeric:"tabular-nums"}}>{fmtK(item.val)}</span><span style={{color:P.muted,marginLeft:8}}>{w.toFixed(1)}%</span></span>
+                              </div>
+                              <div style={{height:5,background:P.border,borderRadius:3}}>
+                                <div style={{height:"100%",width:`${w}%`,background:SVC_COLORS[item.name]||P.blue,borderRadius:3,opacity:0.85}}/>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {clinicMetrics.length>1&&<>
+                        <SH>Revenue Mix Trend</SH>
+                        <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                          <ResponsiveContainer width="100%" height={240}>
+                            <BarChart data={data} barCategoryGap="22%">
+                              <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                              <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                              <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                              <Tooltip content={<TT/>}/>
+                              <Legend/>
+                              {services.map(s=><Bar key={s} dataKey={s} name={s} fill={SVC_COLORS[s]||P.blue} stackId="a" opacity={0.85}/>)}
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </>}
+                    </>
+                  );
+                })()}
+
+                {/* EXPENSES */}
+                {view==="expenses"&&(
+                  <>
+                    <SH>Expense Breakdown — {latest.quarter}</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,overflow:"auto",marginBottom:16}}>
+                      <ExpTable items={latest.expenseDetail} total={latest.opex}/>
+                    </div>
+                    {clinicMetrics.length>1&&<>
+                      <SH>Cost Ratios Over Time</SH>
+                      <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:16}}>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <LineChart data={clinicMetrics}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                            <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                            <YAxis tickFormatter={v=>`${v.toFixed(0)}%`} tick={{fill:P.muted,fontSize:10}} width={40}/>
+                            <Tooltip formatter={v=>`${Number(v).toFixed(1)}%`}/>
+                            <Legend/>
+                            <Line type="monotone" dataKey="wageRatio" name="Wages % Rev" stroke={P.red} strokeWidth={2} dot={{r:2}}/>
+                            <Line type="monotone" dataKey="opexRatio" name="OpEx % Rev" stroke={P.purple} strokeWidth={2} dot={{r:2}}/>
+                            <Line type="monotone" dataKey="gpMargin" name="GP Margin %" stroke={P.green} strokeWidth={2} dot={{r:2}}/>
+                            <ReferenceLine y={55} stroke={P.red} strokeDasharray="3 3" label={{value:"55% wages",fill:P.red,fontSize:9}}/>
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </>}
+                  </>
+                )}
+
+                {/* SEASONALITY */}
+                {view==="seasonality"&&(
+                  <>
+                    <SH>Seasonality — {clinic} ({clinicMetrics.length} quarters)</SH>
+                    {seasonality.length<2
+                      ? <Flag type="info">Load at least 2 full years to see reliable seasonality patterns.</Flag>
+                      : (()=>{
+                          const best  = seasonality.reduce((b,s)=>s.avgRev>b.avgRev?s:b,seasonality[0]);
+                          const worst = seasonality.reduce((b,s)=>s.avgRev<b.avgRev?s:b,seasonality[0]);
+                          const spread = worst.avgRev?((best.avgRev-worst.avgRev)/worst.avgRev*100):0;
+                          return (
+                            <>
+                              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+                                {seasonality.map(s=>(
+                                  <Card key={s.quarter} small label={`${s.quarter} (${s.label})`} value={fmtK(s.avgRev)}
+                                    sub={`Avg EBITDA ${fmtK(s.avgEbitda)} · ${s.avgMargin.toFixed(1)}% · n=${s.n}`}
+                                    color={s===best?P.green:P.text}/>
+                                ))}
+                              </div>
+                              <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:"18px 12px 12px",marginBottom:14}}>
+                                <ResponsiveContainer width="100%" height={200}>
+                                  <BarChart data={seasonality}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                                    <XAxis dataKey={d=>`${d.quarter} ${d.label}`} tick={{fill:P.muted,fontSize:11}}/>
+                                    <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                                    <Tooltip content={<TT/>}/>
+                                    <Legend/>
+                                    <Bar dataKey="avgRev" name="Avg Revenue" fill={CC[clinic]||P.blue} opacity={0.7}>
+                                      {seasonality.map((_,i)=><Cell key={i} fill={CC[clinic]||P.blue} opacity={0.55+i*0.12}/>)}
+                                    </Bar>
+                                    <Bar dataKey="avgEbitda" name="Avg Adj. EBITDA" fill={P.gold} opacity={0.85}/>
+                                  </BarChart>
+                                </ResponsiveContainer>
+                              </div>
+                              <div style={{background:P.alt,borderRadius:10,padding:"12px 16px",fontSize:13,color:P.muted,lineHeight:1.6}}>
+                                Peak is <strong style={{color:P.text}}>{best.quarter} ({best.label})</strong> — avg {fmtK(best.avgRev)}. Slowest is <strong style={{color:P.text}}>{worst.quarter} ({worst.label})</strong>. Revenue spread <strong style={{color:spread>25?P.red:P.gold}}>{spread.toFixed(0)}%</strong> peak-to-trough — {spread>30?"material seasonality. Factor into cash flow, rostering, and valuation normalisation.":"manageable seasonality."}
+                              </div>
+                            </>
+                          );
+                        })()
+                    }
+                  </>
+                )}
+
+                {/* FLAGS */}
+                {view==="flags"&&(
+                  <>
+                    <SH>Risks &amp; Opportunities — {clinic} · {latest.quarter}</SH>
+                    {flags.length===0
+                      ? <Flag type="info">No flags. Load more quarters to enable trend analysis.</Flag>
+                      : flags.map((f,i)=><Flag key={i} type={f.type}>{f.msg}</Flag>)
+                    }
+                  </>
+                )}
+
+                {/* VALUATION */}
+                {view==="targets"&&(
+                  <TargetsView uploads={uploads} quarters={quarters} loadedClinics={[clinic]}/>
+                )}
+
+                {view==="breakeven"&&(
+                  <BreakevenCalc clinicName={clinic} latestMetrics={latest}/>
+                )}
+
+                {view==="valuation"&&(
+                  <>
+                    <SH>Indicative Valuation — {clinic}</SH>
+                    <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:12,padding:24,marginBottom:16}}>
+                      <p style={{fontSize:13,color:P.muted,marginBottom:20,lineHeight:1.7}}>
+                        Physio clinic transactions typically price on 3–5× Adj. EBITDA. Trailing 4Q smooths the year-end D&A spike and seasonality, and is more defensible than a single quarter in a sale process.
+                        {!OWNER_SALARY_CLINICS.includes(clinic)&&" No owner salary add-back at Chirnside Park."}
+                      </p>
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:22}}>
+                        <Card label={`Latest Quarter (${latest.quarter})`} value={fmt(latest.adjEbitda)} sub="Adj. EBITDA"/>
+                        <Card label={`Trailing ${Math.min(4,clinicMetrics.length)}Q Adj. EBITDA`} value={fmt(trailing4Q)} color={P.gold}/>
+                        <Card label="Run-Rate EBITDA Margin" value={latest.revenue?pct(latest.adjEbitda,latest.revenue):"—"} color={P.gold}/>
+                      </div>
+                      <div style={{marginBottom:20}}>
+                        <div style={{fontSize:9,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2,marginBottom:10}}>Valuation Range (3–5× Trailing {Math.min(4,clinicMetrics.length)}Q Adj. EBITDA)</div>
+                        <div style={{display:"flex",height:52,borderRadius:8,overflow:"hidden"}}>
+                          {[3,3.5,4,4.5,5].map((mult,i)=>(
+                            <div key={mult} style={{flex:1,display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",background:`hsl(${200+i*14},55%,${20+i*5}%)`,borderRight:i<4?`1px solid ${P.bg}`:"none"}}>
+                              <span style={{fontSize:9,color:P.muted,fontFamily:"monospace"}}>{mult}×</span>
+                              <span style={{fontSize:12,fontWeight:600,color:P.text}}>{fmtK(trailing4Q*mult)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      {clinicMetrics.length>=5&&(()=>{
+                        const vdata=clinicMetrics.slice(3).map((m,i)=>({quarter:m.quarter,val:clinicMetrics.slice(i,i+4).reduce((s,x)=>s+x.adjEbitda,0)}));
+                        return (
+                          <>
+                            <div style={{fontSize:9,color:P.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1.2,marginBottom:10}}>Rolling 4Q Adj. EBITDA Trajectory</div>
+                            <div style={{background:P.alt,borderRadius:10,padding:"14px 10px"}}>
+                              <ResponsiveContainer width="100%" height={140}>
+                                <AreaChart data={vdata}>
+                                  <defs><linearGradient id="vg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={P.green} stopOpacity={0.3}/><stop offset="95%" stopColor={P.green} stopOpacity={0}/></linearGradient></defs>
+                                  <CartesianGrid strokeDasharray="3 3" stroke={P.border}/>
+                                  <XAxis dataKey="quarter" tick={{fill:P.muted,fontSize:10}} interval={1}/>
+                                  <YAxis tickFormatter={fmtK} tick={{fill:P.muted,fontSize:10}} width={64}/>
+                                  <Tooltip formatter={v=>fmtK(v)} labelFormatter={l=>`Rolling 4Q to ${l}`}/>
+                                  <Area type="monotone" dataKey="val" name="Ann. Adj. EBITDA" stroke={P.green} fill="url(#vg)" strokeWidth={2}/>
+                                </AreaChart>
+                              </ResponsiveContainer>
+                            </div>
+                          </>
+                        );
+                      })()}
+                      <div style={{marginTop:18,padding:"12px 16px",background:`${P.gold}10`,border:`1px solid ${P.gold}28`,borderRadius:8,fontSize:12,color:P.muted,lineHeight:1.7}}>
+                        ⚠ Indicative only. Actual value depends on lease WALE, staff tenure, key-person risk, patient concentration, payer mix (Medicare/DVA/WorkCover/private), growth trajectory, and buyer type. Note: D&A is posted as a year-end journal at Mt Evelyn — for valuation, the trailing 4Q EBITDA will include one quarter's D&A add-back, which may slightly understate true EBITDA if annualising a non-year-end period. Engage a healthcare M&A adviser for a formal valuation.
+                      </div>
+                      {(clinic==="Mt Evelyn"||clinic==="__all")&&(
+                        <div style={{marginTop:12,padding:"12px 16px",background:`${P.blue}08`,border:`1px solid ${P.blue}28`,borderRadius:8,fontSize:12,color:P.muted,lineHeight:1.7}}>
+                          ℹ <strong style={{color:P.text}}>Medfin fit-out loans:</strong> Two Medfin loans are secured against the studio fit-outs — Mt Evelyn #9748 (~$66.5k net) and Chirnside Park #7932 (~$100.4k net) — totalling approximately <strong style={{color:P.text}}>$167k</strong> as at June 2025. Both loans are held in the name of <strong style={{color:P.text}}>Dandenong Ranges Allied Health (DRAH)</strong>, an associated entity that is not part of Form & Practice's operations and would not be included in any sale. Any sale is most likely structured as an <strong style={{color:P.text}}>asset sale</strong> — the buyer acquires business assets (goodwill, equipment, patient list) not company shares — so these liabilities <strong style={{color:P.text}}>do not reduce the purchase price</strong>. They remain with DRAH and must be repaid by the vendor from sale proceeds. Factor ~$167k in loan repayments when modelling your net-of-debt proceeds.
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+
+            {clinic==="__annual"&&(
+              <AnnualOverviewView uploads={uploads} quarters={quarters} loadedClinics={loadedClinics}/>
+            )}
+
+            {clinic==="__cashflow"&&(
+              <CashFlowView cfUploads={cfUploads} plUploads={uploads} loadedClinics={loadedClinics}/>
+            )}
+
+            {clinic==="__explorer"&&(
+              <ExplorerView uploads={uploads} quarters={quarters} loadedClinics={loadedClinics}/>
+            )}
+            {clinic==="__ai"&&(
+              <AIAssistant uploads={uploads} cfUploads={cfUploads} ownerMode={ownerMode}/>
+            )}
+
+            {clinic!=="__all"&&clinic!=="__explorer"&&clinic!=="__cashflow"&&clinic!=="__annual"&&clinic!=="__ai"&&!latest&&(
+              <div style={{textAlign:"center",padding:"48px",color:P.muted}}>No data for {clinic} — drop the XLSX files above.</div>
+            )}
+          </>
+        )}
+
+        {!hasData&&!gmMode&&(
+          <div style={{textAlign:"center",padding:"60px 20px"}}>
+            <div style={{fontSize:30,marginBottom:14,opacity:0.2}}>📊</div>
+            <div style={{fontSize:15,color:P.dim,marginBottom:8}}>Drop your 3 Xero comparison files above</div>
+            <div style={{fontSize:13,color:P.dim,maxWidth:480,margin:"0 auto",lineHeight:1.7}}>
+              One file per clinic · 14 quarters each · all three at once.<br/>
+              Clinic names and all 14 quarters are auto-detected from each file.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(FPDashboard));
+  </script>
+</body>
+</html>
